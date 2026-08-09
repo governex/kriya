@@ -52,7 +52,10 @@ pub mod router;
 
 #[cfg(target_os = "macos")]
 pub use approval::GuiApproval;
-pub use approval::{ApprovalGate, AutoApprove, DenyApproval, TtyApproval};
+pub use approval::{
+    default_approvals_dir, ApprovalDecision, ApprovalGate, AutoApprove, DenyApproval, FileApproval,
+    PendingApproval, TtyApproval, DECISIONS_FILE, PENDING_FILE,
+};
 pub use executor::{
     ActionExecutor, ActionOutcome, FnExecutor, HashScheme, IoDecision, IoDirection, IoKind,
     IoRecord, PersistentProcessExecutor, ProcessExecutor,

@@ -19,7 +19,8 @@
 //!   --config <p.yaml>     load gateway settings from a `.kriya.yaml` config file (see below)
 //!   --policy <p.yaml>     permission policy (default: built-in deny-by-default — reads allow,
 //!                         destructive/spend names require approval, everything else denied)
-//!   --approval <mode>     how guarded calls are decided: deny (default) | tty | gui | auto
+//!   --approval <mode>     how guarded calls are decided: deny (default) | tty | gui | auto | file
+//!                         (file = JSONL mailbox for an out-of-band decider, e.g. K-Apter)
 //!   --actor <agent>       agent identity stamped into every signed receipt (R8). Omit → unattributed
 //!   --user <user>         operator the run acts for (default: $USER). Only used with --actor
 //!   --audit-log <path>    signed-receipt JSONL log. Default: a per-front file under the standard
@@ -70,9 +71,9 @@ use kriya::audit::{default_audit_dir, now_ms, Actor, Receipt, Signer, ATTESTATIO
 #[cfg(target_os = "macos")]
 use kriya::mcp::GuiApproval;
 use kriya::mcp::{
-    ApprovalGate, AutoApprove, DenyApproval, EgressControl, EgressTarget, Governor, HashScheme,
-    IngressControl, IoDecision, IoDirection, IoKind, IoRecord, McpClient, McpProxyExecutor,
-    ProxyServer, TtyApproval,
+    ApprovalGate, AutoApprove, DenyApproval, EgressControl, EgressTarget, FileApproval, Governor,
+    HashScheme, IngressControl, IoDecision, IoDirection, IoKind, IoRecord, McpClient,
+    McpProxyExecutor, ProxyServer, TtyApproval,
 };
 use kriya::mcp::jsonrpc::Tool;
 // Broker (W2): the router core multiplexes N proxied MCP upstreams under one governor. Available
@@ -181,7 +182,7 @@ fn apply_config(args: &mut ProxyArgs, approval_from_cli: bool, cfg: GatewayConfi
 fn usage_and_exit(msg: &str) -> ! {
     eprintln!("kriya-gateway: {msg}");
     eprintln!(
-        "usage: kriya-gateway proxy [--policy <p.yaml>] [--approval deny|tty|gui|auto] \
+        "usage: kriya-gateway proxy [--policy <p.yaml>] [--approval deny|tty|gui|auto|file] \
          [--actor <agent>] [--user <user>] [--audit-log <path>] [--signing-key <path>] \
          [--name <n>] -- <downstream-cmd> [args...]\n       \
          kriya-gateway broker --config broker.yaml [same governance flags]   (ONE endpoint over N MCP upstreams, one governor)\n       \
@@ -307,12 +308,15 @@ fn build_approval(kind: &str) -> Box<dyn ApprovalGate> {
         "deny" => Box::new(DenyApproval),
         "tty" => Box::new(TtyApproval),
         "auto" => Box::new(AutoApprove),
+        // file: route to an out-of-band decider (K-Apter) via the JSONL mailbox — for a standalone
+        // device with no tty and no window server. Deny-default on timeout/IO error.
+        "file" => Box::new(FileApproval::with_default_dir()),
         #[cfg(target_os = "macos")]
         "gui" => Box::new(GuiApproval),
         #[cfg(not(target_os = "macos"))]
         "gui" => usage_and_exit("--approval gui is only available on macOS"),
         other => usage_and_exit(&format!(
-            "--approval must be deny|tty|gui|auto, got '{other}'"
+            "--approval must be deny|tty|gui|auto|file, got '{other}'"
         )),
     }
 }

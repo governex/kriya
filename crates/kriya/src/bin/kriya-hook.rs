@@ -38,7 +38,7 @@
 //!
 //! ## Flags (both subcommands)
 //! ```text
-//! kriya-hook pre|post [--policy <p.yaml>] [--approval deny|tty|gui|auto]
+//! kriya-hook pre|post [--policy <p.yaml>] [--approval deny|tty|gui|auto|file]
 //!                     [--audit-log <path>] [--signing-key <path>]
 //!                     [--actor <agent>] [--user <user>]
 //! ```
@@ -68,7 +68,9 @@
 //!   receipts still make volume visible after the fact.
 //! - Approval modes: `deny` (default — a `require_approval` rule blocks unless changed), `tty`
 //!   (prompt on /dev/tty — terminal sessions only), `gui` (macOS dialog), `auto` (approve all —
-//!   demos only). **Claude Code's own hook timeout (600s default for command hooks) fails OPEN on
+//!   demos only), `file` (route to an out-of-band decider such as K-Apter via the JSONL mailbox —
+//!   for a standalone headless device; self-bounds at 300s → deny, same as tty/gui).
+//!   **Claude Code's own hook timeout (600s default for command hooks) fails OPEN on
 //!   expiry** — a killed/timed-out hook is treated as no decision, and the tool proceeds. This is
 //!   the opposite of an earlier version of this comment, which incorrectly claimed timeouts fail
 //!   closed; verified against the current hooks reference. `tty`/`gui` mitigate this the only way
@@ -92,8 +94,8 @@ use kriya::pay;
 #[cfg(target_os = "macos")]
 use kriya::mcp::GuiApproval;
 use kriya::mcp::{
-    ApprovalGate, AutoApprove, DenyApproval, HashScheme, IoDecision, IoDirection, IoKind, IoRecord,
-    TtyApproval,
+    ApprovalGate, AutoApprove, DenyApproval, FileApproval, HashScheme, IoDecision, IoDirection,
+    IoKind, IoRecord, TtyApproval,
 };
 use kriya::permissions::{
     url_host, BudgetCtx, BudgetGateDecision, BudgetGateRecord, CondRecord, Decision, GateDecision,
@@ -226,6 +228,9 @@ fn approval_gate(mode: &str) -> Result<Box<dyn ApprovalGate>, String> {
         "deny" => Ok(Box::new(DenyApproval)),
         "tty" => Ok(Box::new(TtyApproval)),
         "auto" => Ok(Box::new(AutoApprove)),
+        // file: route to an out-of-band decider (K-Apter) via the JSONL mailbox — for a standalone
+        // device with no tty and no window server. Deny-default on timeout/IO error.
+        "file" => Ok(Box::new(FileApproval::with_default_dir())),
         #[cfg(target_os = "macos")]
         "gui" => Ok(Box::new(GuiApproval)),
         other => Err(format!("unknown --approval mode '{other}'")),

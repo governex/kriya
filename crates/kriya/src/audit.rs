@@ -894,6 +894,20 @@ pub fn default_audit_dir() -> PathBuf {
     }
 }
 
+/// The standard on-device directory for the control-plane Console's local state: `~/.kriya/console/`.
+/// Sibling of [`default_audit_dir`] and computed identically (same home resolution, same temp-dir
+/// fallback, created if missing) so the runtime and the Console agree on where per-device
+/// coordination files live — e.g. the file-approval mailbox under `console/approvals/` that
+/// [`crate::mcp::default_approvals_dir`] derives. Additive: no existing path derivation changes.
+pub fn default_console_dir() -> PathBuf {
+    match home_dir().map(|h| h.join(".kriya").join("console")) {
+        // Best-effort create; on failure (e.g. a read-only home) fall back to temp so callers still
+        // have a writable location rather than silently failing.
+        Some(dir) if std::fs::create_dir_all(&dir).is_ok() => dir,
+        _ => std::env::temp_dir(),
+    }
+}
+
 /// Resolve the user's home directory without pulling in a dependency: `$HOME` on Unix,
 /// `%USERPROFILE%` on Windows. `None` if neither is set.
 fn home_dir() -> Option<PathBuf> {

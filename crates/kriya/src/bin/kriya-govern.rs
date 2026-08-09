@@ -36,11 +36,11 @@
 //! (use the gateway/containment lanes for that).
 //!
 //! Usage:
-//!   kriya-govern [--policy <policy.yaml>] [--approval deny|tty|gui|auto]
+//!   kriya-govern [--policy <policy.yaml>] [--approval deny|tty|gui|auto|file]
 //!                [--actor <agent>] [--user <user>] [--audit-log <path>]
 //!
 //!   --policy     YAML permission policy (default: the safe built-in default).
-//!   --approval   how `require_approval` actions are decided: deny (default), tty, gui (macOS), auto.
+//!   --approval   how `require_approval` actions are decided: deny (default), tty, gui (macOS), auto, file (JSONL mailbox → K-Apter).
 //!   --actor      agent identity stamped into every signed receipt's `actor` (R8).
 //!   --user       operator identity (default: $USER). Only used with --actor.
 //!   --audit-log  signed-receipt JSONL path. Point it at ~/.kriya/audit/<name>.jsonl for the Console
@@ -56,7 +56,7 @@ use kriya::budget::BudgetTracker;
 use kriya::corr::{self, Correlation};
 #[cfg(target_os = "macos")]
 use kriya::mcp::GuiApproval;
-use kriya::mcp::{ApprovalGate, AutoApprove, DenyApproval, TtyApproval};
+use kriya::mcp::{ApprovalGate, AutoApprove, DenyApproval, FileApproval, TtyApproval};
 use kriya::permissions::{Decision, Policy};
 use serde_json::{json, Value};
 
@@ -71,7 +71,7 @@ struct Args {
 fn usage_and_exit(msg: &str) -> ! {
     eprintln!("kriya-govern: {msg}");
     eprintln!(
-        "usage: kriya-govern [--policy <policy.yaml>] [--approval deny|tty|gui|auto] \
+        "usage: kriya-govern [--policy <policy.yaml>] [--approval deny|tty|gui|auto|file] \
          [--actor <agent>] [--user <user>] [--audit-log <path>]"
     );
     exit(2);
@@ -115,12 +115,15 @@ fn build_approval(mode: &str) -> Box<dyn ApprovalGate> {
         "deny" => Box::new(DenyApproval),
         "auto" => Box::new(AutoApprove),
         "tty" => Box::new(TtyApproval),
+        // file: route to an out-of-band decider (K-Apter) via the JSONL mailbox — for a standalone
+        // device with no tty and no window server. Deny-default on timeout/IO error.
+        "file" => Box::new(FileApproval::with_default_dir()),
         #[cfg(target_os = "macos")]
         "gui" => Box::new(GuiApproval),
         #[cfg(not(target_os = "macos"))]
         "gui" => usage_and_exit("--approval gui is only available on macOS"),
         other => usage_and_exit(&format!(
-            "--approval must be deny|tty|gui|auto, got '{other}'"
+            "--approval must be deny|tty|gui|auto|file, got '{other}'"
         )),
     }
 }

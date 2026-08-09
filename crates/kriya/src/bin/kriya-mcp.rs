@@ -8,7 +8,7 @@
 //!
 //! Usage:
 //!   kriya-mcp --tools <schemas.json> [--policy <policy.yaml>] [--exec "<cmd>"]
-//!            [--approval deny|tty|gui|auto] [--name <name>] [--actor <agent>] [--user <user>]
+//!            [--approval deny|tty|gui|auto|file] [--name <name>] [--actor <agent>] [--user <user>]
 //!
 //!   --tools     JSON array from the SDK's getToolSchemas() (required)
 //!   --policy    YAML permission policy (default: safe built-in — create/edit allow,
@@ -17,7 +17,8 @@
 //!               writes {"success","data","error"} on stdout. Omit for discovery-only.
 //!   --approval  how guarded actions are decided: deny (default), tty (prompt a human on
 //!               the terminal), gui (native macOS dialog — works under a TUI host like Claude
-//!               Code), or auto (approve — trusted/testing only)
+//!               Code), auto (approve — trusted/testing only), or file (route to an out-of-band
+//!               decider such as K-Apter via the JSONL mailbox — for a standalone headless device)
 //!   --name      server name reported in `initialize` (default: kriya-mcp)
 //!   --actor     identity of the agent/client driving the server — stamped into every signed
 //!               receipt's `actor` field (R8). Omit to leave receipts unattributed.
@@ -32,8 +33,8 @@ use kriya::audit::{Actor, Signer};
 #[cfg(target_os = "macos")]
 use kriya::mcp::GuiApproval;
 use kriya::mcp::{
-    ActionExecutor, ActionOutcome, ApprovalGate, AutoApprove, DenyApproval, FnExecutor, Governor,
-    PersistentProcessExecutor, ProcessExecutor, Server, TtyApproval,
+    ActionExecutor, ActionOutcome, ApprovalGate, AutoApprove, DenyApproval, FileApproval,
+    FnExecutor, Governor, PersistentProcessExecutor, ProcessExecutor, Server, TtyApproval,
 };
 use kriya::permissions::Policy;
 use kriya::protocol::ToolSchema;
@@ -62,7 +63,7 @@ fn usage_and_exit(msg: &str) -> ! {
     eprintln!("kriya-mcp: {msg}");
     eprintln!(
         "usage: kriya-mcp --tools <schemas.json> [--policy <policy.yaml>] [--exec \"<cmd>\"] \
-         [--persistent] [--approval deny|tty|gui|auto] [--name <name>] \
+         [--persistent] [--approval deny|tty|gui|auto|file] [--name <name>] \
          [--actor <agent>] [--user <user>] [--audit-log <path>]\n\
          \x20      kriya-mcp --evidence [--audit <file-or-dir>] [--name <name>] \
          [--actor <agent>] [--user <user>] [--audit-log <path>]   (read-only evidence reader)"
@@ -152,6 +153,9 @@ fn build_approval(kind: &str) -> Box<dyn ApprovalGate> {
         "deny" => Box::new(DenyApproval),
         "tty" => Box::new(TtyApproval),
         "auto" => Box::new(AutoApprove),
+        // file: route to an out-of-band decider (K-Apter) via the JSONL mailbox — for a standalone
+        // device with no tty and no window server. Deny-default on timeout/IO error.
+        "file" => Box::new(FileApproval::with_default_dir()),
         // Native macOS approval dialog — works even when the server is a child of a TUI host
         // (e.g. Claude Code) that owns the controlling terminal.
         #[cfg(target_os = "macos")]
@@ -159,7 +163,7 @@ fn build_approval(kind: &str) -> Box<dyn ApprovalGate> {
         #[cfg(not(target_os = "macos"))]
         "gui" => usage_and_exit("--approval gui is only available on macOS"),
         other => usage_and_exit(&format!(
-            "--approval must be deny|tty|gui|auto, got '{other}'"
+            "--approval must be deny|tty|gui|auto|file, got '{other}'"
         )),
     }
 }
