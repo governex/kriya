@@ -8,9 +8,15 @@
 //! launched via `run --` cannot reach an arbitrary local port directly (the containment actually
 //! contains); the unit tests prove what happens to traffic that DOES go through the proxy.
 //!
-//! macOS-only (Seatbelt): mirrors `kriya_hook_smoke.rs`'s self-building pattern.
+//! macOS-only (Seatbelt): mirrors `kriya_hook_smoke.rs`'s self-building pattern. Gated on the
+//! `contain` feature it exercises — the symbols it calls (`kriya::mcp::contain_sha256_hex`,
+//! `seatbelt_profile`) are `#[cfg(feature = "contain")]` in `mcp/mod.rs`, so without this guard a
+//! bare `cargo test -p kriya` fails to COMPILE the test target. Same idiom as the other
+//! feature-gated suites (`fips_fixture.rs`, `pq_fixture.rs`, `broker_http.rs`,
+//! `wasmexec_determinism.rs`).
 
 #![cfg(target_os = "macos")]
+#![cfg(feature = "contain")]
 
 use std::net::TcpListener;
 use std::path::PathBuf;
