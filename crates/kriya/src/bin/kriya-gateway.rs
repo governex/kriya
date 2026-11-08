@@ -189,6 +189,8 @@ fn usage_and_exit(msg: &str) -> ! {
          kriya-gateway run [--policy <p.yaml with an egress: section>] [same governance flags] -- <agent-cmd> [args...]\n       \
          \x20  (EG-C containment, macOS only: forces the launched agent's egress through the governed lane —\n       \
          \x20  see the honest ceiling in kriya::mcp::contain's module doc before selling this)\n       \
+         kriya-gateway egress [--listen host:port] --policy <p.yaml with an egress: section> [same governance flags]\n       \
+         \x20  (standalone governed egress proxy, no launched child — the Linux sidecar lane)\n       \
          kriya-gateway serve ...   (delegates to the kriya-mcp bolt-on)"
     );
     exit(2);
@@ -197,7 +199,7 @@ fn usage_and_exit(msg: &str) -> ! {
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1);
     let sub = args.next().unwrap_or_else(|| {
-        usage_and_exit("a subcommand is required (proxy|broker|run|serve)")
+        usage_and_exit("a subcommand is required (proxy|broker|egress|run|serve)")
     });
     match sub.as_str() {
         "proxy" => run_proxy(parse_proxy_args(args)),
@@ -209,6 +211,10 @@ fn main() -> std::io::Result<()> {
         // kriya::mcp::contain's module doc before selling this: it is network-only (the spike
         // found unified-log exec/file fidelity too weak to claim more) and macOS-only in v1.
         "run" => run_contained(args),
+        // Standalone governed egress proxy (no launched child): the Linux sidecar lane. The
+        // process in the same pod/host points HTTP(S)_PROXY at `--listen`; policy comes from the
+        // same `egress:` section `run` uses, decisions are signed to the same audit chain.
+        "egress" => run_egress(args),
         // The existing in-process bolt-on lives in the `kriya-mcp` binary; keep one tool per
         // entry point rather than duplicating its wiring here.
         "serve" => usage_and_exit(
@@ -219,7 +225,7 @@ fn main() -> std::io::Result<()> {
         // Accessibility preflight were removed 2026-08-07 — the library is govern/audit-only now.
         // Last released in crates.io kriya 0.1.4 (non-default features); recover from git history.
         other => usage_and_exit(&format!(
-            "unknown subcommand: {other} (expected proxy|broker|run|serve)"
+            "unknown subcommand: {other} (expected proxy|broker|egress|run|serve)"
         )),
     }
 }
@@ -1230,6 +1236,98 @@ fn run_contained(it: impl Iterator<Item = String>) -> std::io::Result<()> {
             )),
         }
     }
+}
+
+/// Standalone governed egress proxy (the Linux sidecar lane): serve [`ConnectProxy`] on a fixed
+/// listen address, with no launched child. `run` wraps a process it spawns; `egress` governs
+/// whatever the operator pointed at it — the shape a pod sidecar needs, where the agent container
+/// is its own process and only shares the network namespace. Policy, receipts and the audit chain
+/// are identical to the contained lane.
+#[cfg(feature = "contain")]
+fn run_egress(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
+    let mut listen = "127.0.0.1:15080".to_string();
+    let mut policy_path: Option<PathBuf> = None;
+    let mut actor_flag: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut audit_log: Option<PathBuf> = None;
+    let mut signing_key: Option<PathBuf> = None;
+    while let Some(flag) = it.next() {
+        let mut take = |label: &str| -> String {
+            it.next()
+                .unwrap_or_else(|| usage_and_exit(&format!("{label} needs a value")))
+        };
+        match flag.as_str() {
+            "--listen" => listen = take("--listen"),
+            "--policy" => policy_path = Some(PathBuf::from(take("--policy"))),
+            "--actor" => actor_flag = Some(take("--actor")),
+            "--user" => user = Some(take("--user")),
+            "--audit-log" => audit_log = Some(PathBuf::from(take("--audit-log"))),
+            "--signing-key" => signing_key = Some(PathBuf::from(take("--signing-key"))),
+            "-h" | "--help" => usage_and_exit("help"),
+            other => usage_and_exit(&format!("unknown argument: {other}")),
+        }
+    }
+    let policy = match &policy_path {
+        Some(p) => Policy::load_or_default(p),
+        None => usage_and_exit("egress requires --policy <p.yaml> with an `egress:` section"),
+    };
+    let Some(egress_policy) = policy.egress().cloned() else {
+        usage_and_exit(
+            "egress requires the policy to have an `egress:` section — see doc 24 §7.3 for the shape",
+        )
+    };
+    for w in policy.warnings() {
+        eprintln!("[kriya-gateway] policy warning: {w}");
+    }
+
+    let audit_log = resolve_audit_log(audit_log, "egress");
+    let signer = build_signer(&audit_log, &signing_key);
+    let actor = build_actor(actor_flag, user);
+    write_startup_attestation(&signer, signing_key.is_some(), &actor);
+
+    use kriya::mcp::{ConnectProxy, RUN_START};
+    let scope_token = uuid::Uuid::new_v4().to_string();
+    let proxy = match ConnectProxy::spawn_on(
+        &listen,
+        egress_policy,
+        signer.clone(),
+        actor.clone(),
+        scope_token.clone(),
+    ) {
+        Ok(p) => p,
+        Err(e) => usage_and_exit(&format!("egress: failed to bind {listen}: {e}")),
+    };
+    signer.record(
+        Receipt::new(
+            uuid::Uuid::new_v4().to_string(),
+            RUN_START.to_string(),
+            serde_json::json!({
+                "scope_token": scope_token,
+                "proxy_port": proxy.port(),
+                "listen": listen,
+                "downstream": ["egress-daemon"],
+            }),
+            true,
+            now_ms(),
+        )
+        .with_actor(actor),
+    );
+    eprintln!(
+        "[kriya-gateway] egress: governed proxy listening on {listen} · audit log={}",
+        audit_log.display()
+    );
+    // Serve until the pod runtime stops the process; the proxy's own threads do the work.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// Built WITHOUT the `contain` feature: tell the operator how to get it.
+#[cfg(not(feature = "contain"))]
+fn run_egress(_it: impl Iterator<Item = String>) -> std::io::Result<()> {
+    usage_and_exit(
+        "this gateway build has no egress-proxy support — rebuild with `--features mcp-client,contain`",
+    )
 }
 
 /// Built WITHOUT the `contain` feature: tell the operator how to get it.

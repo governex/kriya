@@ -106,6 +106,31 @@ impl ConnectProxy {
         scope_token: String,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        Self::from_listener(listener, policy, signer, actor, scope_token)
+    }
+
+    /// [`Self::spawn`], but bound on an operator-chosen address (for example a fixed loopback
+    /// port inside a pod, where the containers share one network namespace and the governed
+    /// process points `HTTP(S)_PROXY` at it) instead of an OS-assigned port. Same proxy, same
+    /// policy evaluation, same receipts — only the bind differs.
+    pub fn spawn_on(
+        addr: &str,
+        policy: EgressPolicy,
+        signer: Arc<Signer>,
+        actor: Option<Actor>,
+        scope_token: String,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        Self::from_listener(listener, policy, signer, actor, scope_token)
+    }
+
+    fn from_listener(
+        listener: TcpListener,
+        policy: EgressPolicy,
+        signer: Arc<Signer>,
+        actor: Option<Actor>,
+        scope_token: String,
+    ) -> std::io::Result<Self> {
         let port = listener.local_addr()?.port();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
