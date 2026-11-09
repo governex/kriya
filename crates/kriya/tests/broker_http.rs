@@ -616,3 +616,198 @@ fn http_served_broker_forwards_the_chain_to_an_http_upstream() {
         .all(|l| serde_json::from_str::<Value>(l).unwrap()["params"]["chain"].is_array()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─── Session recovery: a restarted remote upstream (new process, old Mcp-Session-Id unknown) ─────
+
+/// How the fake upstream rejects a `tools/call` carrying a session id it doesn't know.
+#[derive(Clone, Copy, PartialEq)]
+enum Reject {
+    /// HTTP 404 with a JSON-RPC "Session not found" body (what the MCP SDK servers send).
+    Http404,
+    /// HTTP 200 whose body is a JSON-RPC "Session not found" error.
+    RpcError,
+    /// Every `tools/call` is rejected with 404, even on a fresh session (retry must fail once).
+    Always404,
+    /// The first `tools/call` connection is dropped without an HTTP reply (reset), then normal.
+    DropOnce,
+}
+
+/// One request the fake upstream saw: (method, Mcp-Session-Id, X-Kriya-Chain).
+type Seen = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
+
+/// A fake HTTP MCP upstream whose live session id changes on every `initialize` (`s1`, `s2`, …).
+/// After `restart` is set, the server "forgets" all earlier sessions — exactly what a restarted pod
+/// does — and rejects them per `mode`.
+fn spawn_restartable_upstream(
+    mode: Reject,
+    restart: Arc<std::sync::atomic::AtomicBool>,
+    seen: Seen,
+) -> String {
+    use std::sync::atomic::Ordering;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut inits = 0u32;
+        let mut current: Option<String> = None;
+        let mut dropped = false;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let (mut len, mut sid, mut chain) = (0usize, None, None);
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = h.split_once(':') {
+                    let v = v.trim().to_string();
+                    match k.to_ascii_lowercase().as_str() {
+                        "content-length" => len = v.parse().unwrap_or(0),
+                        "mcp-session-id" => sid = Some(v),
+                        "x-kriya-chain" => chain = Some(v),
+                        _ => {}
+                    }
+                }
+            }
+            if mode == Reject::DropOnce
+                && restart.load(Ordering::SeqCst)
+                && !dropped
+                && len > 0
+            {
+                // Drop the first post-restart connection outright, body unread — the client sees
+                // the connection reset/closed with no HTTP reply, as when a pod goes away.
+                dropped = true;
+                seen.lock().unwrap().push(("<dropped>".into(), sid, chain));
+                drop(reader);
+                drop(stream);
+                continue;
+            }
+            let mut body = vec![0u8; len];
+            let _ = reader.read_exact(&mut body);
+            let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let method = req["method"].as_str().unwrap_or("").to_string();
+            seen.lock()
+                .unwrap()
+                .push((method.clone(), sid.clone(), chain.clone()));
+            let Some(id) = req.get("id").cloned() else {
+                write_http(&mut stream, "202 Accepted", None, None);
+                continue;
+            };
+            if method == "initialize" {
+                inits += 1;
+                let s = format!("s{inits}");
+                current = Some(s.clone());
+                let resp = json!({"jsonrpc":"2.0","id":id,"result":{
+                    "protocolVersion":"2025-06-18","capabilities":{"tools":{}},
+                    "serverInfo":{"name":"restartable","version":"1"}}});
+                write_http(&mut stream, "200 OK", Some(&resp.to_string()), Some(&s));
+                continue;
+            }
+            // After a restart the server only knows sessions minted since (s2+).
+            let known = sid.is_some()
+                && sid == current
+                && !(restart.load(Ordering::SeqCst) && sid.as_deref() == Some("s1"));
+            let not_found = json!({"jsonrpc":"2.0","id":"server-error",
+                "error":{"code":-32600,"message":"Session not found"}})
+            .to_string();
+            if method == "tools/call" && (mode == Reject::Always404 && restart.load(Ordering::SeqCst)) {
+                write_http(&mut stream, "404 Not Found", Some(&not_found), None);
+                continue;
+            }
+            if !known {
+                match mode {
+                    Reject::RpcError => {
+                        let e = json!({"jsonrpc":"2.0","id":id,
+                            "error":{"code":-32600,"message":"Session not found"}});
+                        write_http(&mut stream, "200 OK", Some(&e.to_string()), None);
+                    }
+                    _ => write_http(&mut stream, "404 Not Found", Some(&not_found), None),
+                }
+                continue;
+            }
+            let result = match method.as_str() {
+                "tools/list" => json!({"tools":[{"name":"list_items","description":"read",
+                    "inputSchema":{"type":"object"}}]}),
+                _ => json!({"content":[{"type":"text","text":format!("ok via {}", sid.unwrap())}]}),
+            };
+            let resp = json!({"jsonrpc":"2.0","id":id,"result":result});
+            write_http(&mut stream, "200 OK", Some(&resp.to_string()), None);
+        }
+    });
+    url
+}
+
+/// Connect + handshake (session `s1`), "restart" the upstream, then make one chained call.
+fn call_across_restart(mode: Reject) -> (Result<String, String>, Vec<(String, Option<String>, Option<String>)>) {
+    let restart = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_restartable_upstream(mode, restart.clone(), seen.clone());
+    let mut client = McpClient::connect_http(&url, vec![], false, None).expect("connect");
+    client.initialize().expect("initialize");
+    assert_eq!(client.list_tools().expect("list").len(), 1);
+    restart.store(true, std::sync::atomic::Ordering::SeqCst);
+    seen.lock().unwrap().clear();
+    client.set_call_chain(Some("fieldwatch,broker-actor".into()));
+    let out = client
+        .call_tool("list_items", &json!({}))
+        .map(|r| r.content[0]["text"].as_str().unwrap_or("").to_string());
+    let log = seen.lock().unwrap().clone();
+    (out, log)
+}
+
+fn methods(log: &[(String, Option<String>, Option<String>)]) -> Vec<&str> {
+    log.iter().map(|(m, _, _)| m.as_str()).collect()
+}
+
+#[test]
+fn http_client_recovers_a_lost_session_on_404_and_retries_once_with_the_chain() {
+    let (out, log) = call_across_restart(Reject::Http404);
+    assert_eq!(out.as_deref(), Ok("ok via s2"), "{log:?}");
+    assert_eq!(
+        methods(&log),
+        ["tools/call", "initialize", "notifications/initialized", "tools/call"]
+    );
+    assert_eq!(log[0].1.as_deref(), Some("s1"), "first try on the stale session");
+    assert_eq!(log[1].1, None, "re-initialize drops the stale session id");
+    assert_eq!(log[1].2, None, "handshake carries no X-Kriya-Chain");
+    assert_eq!(log[2].1.as_deref(), Some("s2"));
+    assert_eq!(log[3].1.as_deref(), Some("s2"), "retry uses the new session");
+    assert_eq!(log[3].2.as_deref(), Some("fieldwatch,broker-actor"), "chain kept on retry");
+}
+
+#[test]
+fn http_client_recovers_a_lost_session_on_a_jsonrpc_session_not_found_error() {
+    let (out, log) = call_across_restart(Reject::RpcError);
+    assert_eq!(out.as_deref(), Ok("ok via s2"), "{log:?}");
+    assert_eq!(
+        methods(&log),
+        ["tools/call", "initialize", "notifications/initialized", "tools/call"]
+    );
+}
+
+#[test]
+fn http_client_recovers_after_a_dropped_connection() {
+    let (out, log) = call_across_restart(Reject::DropOnce);
+    assert_eq!(out.as_deref(), Ok("ok via s2"), "{log:?}");
+    assert_eq!(
+        methods(&log),
+        ["<dropped>", "initialize", "notifications/initialized", "tools/call"]
+    );
+    assert_eq!(log[3].2.as_deref(), Some("fieldwatch,broker-actor"));
+}
+
+#[test]
+fn http_client_surfaces_the_error_when_the_single_retry_also_fails() {
+    let (out, log) = call_across_restart(Reject::Always404);
+    let err = out.expect_err("retry fails too");
+    assert!(err.contains("HTTP 404") && err.contains("Session not found"), "{err}");
+    assert_eq!(
+        methods(&log),
+        ["tools/call", "initialize", "notifications/initialized", "tools/call"],
+        "exactly one re-handshake and one retry"
+    );
+}

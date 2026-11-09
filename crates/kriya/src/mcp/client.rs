@@ -161,14 +161,7 @@ impl McpClient {
     /// MCP handshake: send `initialize`, read the downstream's `InitializeResult`, then send the
     /// `notifications/initialized` notification the downstream expects before it will serve tools.
     pub fn initialize(&mut self) -> Result<InitializeResult, String> {
-        let params = json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            // The proxy is itself an MCP client to the downstream; advertise nothing we don't
-            // proxy. Downstream-initiated sampling/elicitation is the full-lifecycle concern.
-            "capabilities": {},
-            "clientInfo": { "name": "kriya-gateway", "version": env!("CARGO_PKG_VERSION") },
-        });
-        let result = self.request("initialize", Some(params))?;
+        let result = self.request("initialize", Some(initialize_params()))?;
         let init: InitializeResult = parse_init(&result)?;
         // A spec-compliant server waits for this notification before considering itself ready.
         self.notify("notifications/initialized", None)?;
@@ -432,7 +425,49 @@ impl HttpTransport {
         req
     }
 
+    /// Send `method` and return its `result`. Session recovery: when the upstream has restarted —
+    /// the stored `Mcp-Session-Id` is rejected (HTTP 404 / "Session not found") or the connection is
+    /// refused/reset — drop the session, re-run the `initialize` handshake (capturing the new
+    /// session id), and retry the original request exactly ONCE. A second failure surfaces as-is.
+    /// `initialize` itself is never retried this way (it IS the handshake).
     fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value, String> {
+        match self.attempt(method, params.clone()) {
+            Ok(v) => Ok(v),
+            Err(e) if e.recoverable && method != "initialize" => {
+                self.session_id = None;
+                if let Err(h) = self.rehandshake() {
+                    return Err(format!(
+                        "{} (session recovery re-initialize failed: {h})",
+                        e.message
+                    ));
+                }
+                eprintln!(
+                    "[kriya] remote MCP upstream {}: session re-established after: {}",
+                    self.host, e.message
+                );
+                self.attempt(method, params).map_err(|e| e.message)
+            }
+            Err(e) => Err(e.message),
+        }
+    }
+
+    /// The `initialize` + `notifications/initialized` handshake on this transport, used to recover
+    /// a lost session. The per-call `X-Kriya-Chain` is withheld from the handshake (it is protocol
+    /// setup, not the governed call) and restored for the retried request.
+    fn rehandshake(&mut self) -> Result<(), String> {
+        let chain = self.call_chain.take();
+        let result = self
+            .attempt("initialize", Some(initialize_params()))
+            .map_err(|e| e.message)
+            .and_then(|r| parse_init(&r).map(|_| ()))
+            .and_then(|_| self.notify("notifications/initialized", None));
+        self.call_chain = chain;
+        result
+    }
+
+    /// One HTTP attempt of `method`. Classifies failures as recoverable (see [`AttemptError`]).
+    fn attempt(&mut self, method: &str, params: Option<Value>) -> Result<Value, AttemptError> {
+        let had_session = self.session_id.is_some();
         let id = self.alloc_id();
         let mut msg = json!({ "jsonrpc": "2.0", "id": id, "method": method });
         if let Some(p) = params {
@@ -471,7 +506,8 @@ impl HttpTransport {
         // here is configured and scoped to this host; this is the actual enforcement (defense in
         // depth, same dual-layer shape as the B6 SSRF guard) and fails closed independently of it.
         let send_body = match &self.secrets {
-            Some(secrets) => crate::secrets::broker_body(&body, secrets, &self.host)?,
+            Some(secrets) => crate::secrets::broker_body(&body, secrets, &self.host)
+                .map_err(AttemptError::fatal)?,
             None => zeroize::Zeroizing::new(body.clone()),
         };
 
@@ -479,12 +515,24 @@ impl HttpTransport {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
                 let body = r.into_string().unwrap_or_default();
-                return Err(format!(
-                    "remote {method} HTTP {code}: {}",
-                    body.trim().chars().take(300).collect::<String>()
-                ));
+                // 404 on an established session = the server no longer knows our session id
+                // (MCP streamable HTTP: the client MUST start a new session).
+                let session_lost = had_session
+                    && (code == 404 || body.contains("Session not found"));
+                return Err(AttemptError {
+                    message: format!(
+                        "remote {method} HTTP {code}: {}",
+                        body.trim().chars().take(300).collect::<String>()
+                    ),
+                    recoverable: session_lost,
+                });
             }
-            Err(e) => return Err(format!("remote {method} request failed: {e}")),
+            Err(ureq::Error::Transport(t)) => {
+                return Err(AttemptError {
+                    recoverable: is_reconnectable(&t),
+                    message: format!("remote {method} request failed: {t}"),
+                })
+            }
         };
 
         // Capture the session id the server assigns (typically on the initialize reply).
@@ -496,7 +544,11 @@ impl HttpTransport {
             // SSE: count the bytes CONSUMED up to the correlated reply and flag the count partial —
             // an early-return stream is never fully drained, so `bytes_in` is a lower bound (L2).
             let (value, consumed) =
-                sse_find_result_counted(BufReader::new(resp.into_reader()), id, method)?;
+                sse_find_result_counted(BufReader::new(resp.into_reader()), id, method)
+                    .map_err(|m| AttemptError {
+                        recoverable: had_session && m.contains("Session not found"),
+                        message: m,
+                    })?;
             if let Some(io) = self.last_io.as_mut() {
                 io.bytes_in = Some(consumed);
                 io.bytes_in_is_partial = true;
@@ -505,13 +557,17 @@ impl HttpTransport {
         } else {
             let body = resp
                 .into_string()
-                .map_err(|e| format!("remote {method}: reading body: {e}"))?;
+                .map_err(|e| AttemptError::fatal(format!("remote {method}: reading body: {e}")))?;
             if let Some(io) = self.last_io.as_mut() {
                 io.bytes_in = Some(body.len() as u64);
             }
-            let v: Value = serde_json::from_str(&body)
-                .map_err(|e| format!("remote {method}: reply is not JSON: {e}"))?;
-            extract_result(&v, id, method)
+            let v: Value = serde_json::from_str(&body).map_err(|e| {
+                AttemptError::fatal(format!("remote {method}: reply is not JSON: {e}"))
+            })?;
+            extract_result(&v, id, method).map_err(|message| AttemptError {
+                recoverable: had_session && is_session_not_found(&v),
+                message,
+            })
         }
     }
 
@@ -591,6 +647,73 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+/// The `initialize` params this client sends — shared by [`McpClient::initialize`] and the HTTP
+/// transport's session-recovery re-handshake.
+fn initialize_params() -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        // The proxy is itself an MCP client to the downstream; advertise nothing we don't
+        // proxy. Downstream-initiated sampling/elicitation is the full-lifecycle concern.
+        "capabilities": {},
+        "clientInfo": { "name": "kriya-gateway", "version": env!("CARGO_PKG_VERSION") },
+    })
+}
+
+/// One failed HTTP attempt. `recoverable` marks the failures a restarted upstream produces — the
+/// old `Mcp-Session-Id` rejected (HTTP 404, or a JSON-RPC "Session not found" error) or the
+/// connection refused/reset (the pod's address changed) — which earn one re-handshake + one retry.
+#[cfg(feature = "mcp-http")]
+struct AttemptError {
+    message: String,
+    recoverable: bool,
+}
+
+#[cfg(feature = "mcp-http")]
+impl AttemptError {
+    fn fatal(message: String) -> Self {
+        Self { message, recoverable: false }
+    }
+}
+
+/// A transport failure that a restarted upstream causes: connection refused, or the (possibly
+/// pooled) connection reset/aborted/closed under us. Timeouts are deliberately NOT included — a
+/// timed-out `tools/call` may still be running server-side, and replaying it is not ours to decide.
+#[cfg(feature = "mcp-http")]
+fn is_reconnectable(t: &ureq::Transport) -> bool {
+    use std::error::Error as _;
+    match t.kind() {
+        ureq::ErrorKind::ConnectionFailed => true,
+        ureq::ErrorKind::Io => {
+            let mut src = t.source();
+            while let Some(e) = src {
+                if let Some(io) = e.downcast_ref::<std::io::Error>() {
+                    return matches!(
+                        io.kind(),
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::NotConnected
+                    );
+                }
+                src = e.source();
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Whether a JSON-RPC reply is the server saying our session id is unknown to it.
+#[cfg(feature = "mcp-http")]
+fn is_session_not_found(v: &Value) -> bool {
+    v.get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.contains("Session not found"))
 }
 
 /// Pull `result` out of a JSON-RPC response value (or map a JSON-RPC error to `Err`). Shared by the
