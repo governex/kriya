@@ -62,6 +62,10 @@ pub mod duration;
 // for embedders that never proxy local inference — see `llm/mod.rs` for the layering.
 #[cfg(feature = "llm-proxy")]
 pub mod llm;
+// Shared hand-rolled HTTP/1.1 parsing + `ureq` forwarding for the std-`TcpListener` reverse proxies
+// (`llm::proxy` and the governed LLM lane `mcp::llm_gateway`). Crate-private plumbing.
+#[cfg(any(feature = "llm-proxy", all(feature = "contain", feature = "mcp-http")))]
+pub(crate) mod http1;
 pub mod mcp;
 pub mod memory;
 // D1 (doc 27 §4 / docs/design/d1-memory-receipts.md): memory-write receipt classifier + emitter,

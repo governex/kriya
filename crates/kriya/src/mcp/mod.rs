@@ -41,6 +41,12 @@ pub mod proxy_server;
 #[cfg(feature = "contain")]
 pub mod contain;
 
+// Governed LLM lane (`kriya-gateway egress --llm-listen`): a plain-HTTP OpenAI/Anthropic
+// pass-through that scans + rewrites prompts and replies inline and receipts every request on the
+// egress chain. Needs the egress tier (`contain`) and the outbound `ureq` client (`mcp-http`).
+#[cfg(all(feature = "contain", feature = "mcp-http"))]
+pub mod llm_gateway;
+
 // Router — ONE MCP endpoint multiplexing multiple governed fronts under ONE Governor (one
 // policy, one signer/audit, one actor). The broker (`kriya-gateway broker`, W2) is its consumer:
 // it multiplexes N proxied MCP upstreams behind a namespacing `RouterExecutor` and serves their
@@ -78,6 +84,8 @@ pub use proxy_server::ProxyServer;
 
 #[cfg(feature = "contain")]
 pub use contain::{seatbelt_profile, sha256_hex as contain_sha256_hex, ConnectProxy, RUN_EXIT, RUN_START};
+#[cfg(all(feature = "contain", feature = "mcp-http"))]
+pub use llm_gateway::{LlmGateway, LlmGatewayConfig, LlmUpstreams, LLM_DENY, LLM_REQUEST};
 
 // Router public surface: the multiplexing executor + the unified serve loop. Portable (no FFI) —
 // the broker's engine (W2), multiplexing proxied MCP upstreams under one Governor.

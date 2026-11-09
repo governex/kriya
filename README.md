@@ -104,7 +104,8 @@ kriya governs agent actions through the surfaces where an agent already acts:
 every attached MCP server), the **MCP gateway/broker** (`kriya-gateway proxy` in front of any MCP
 server, `kriya-gateway broker` multiplexing N upstreams under one governor), the **LLM proxy**
 (`kriya-llm-proxy` in front of a local inference server), and the **governed egress/exec lanes**
-(`kriya-gateway run` containment, `kriya-run-wasm` deterministic execution). Every governed action
+(`kriya-gateway run` containment, `kriya-gateway egress` — the standalone CONNECT proxy plus its
+`--llm-listen` OpenAI/Anthropic pass-through — and `kriya-run-wasm` deterministic execution). Every governed action
 gets a policy decision and an Ed25519-signed, hash-chained, offline-verifiable receipt — richness
 tiered by instrumentation: semantic deny/approve of a **named** action at the top (bolt-on/serve),
 tool-call gating through the proxy/hook seams elsewhere.
@@ -293,6 +294,55 @@ kriya-llm-proxy hash-model /path/to/your-model.gguf
 > it — no receipt, no gate. Closing that gap is a watcher-ladder item, not this one; never claim "all
 > local inference" coverage from this proxy alone. **v1 scope:** observe + gate on model identity —
 > deterministic re-execution and OMS/Sigstore manifest verification are later phases, not built here.
+
+## Govern cloud LLM API calls — `kriya-gateway egress --llm-listen`
+
+`kriya-gateway egress` is the standalone governed egress proxy (a CONNECT proxy on `--listen`, the
+policy's `egress:` tier deciding which hosts an agent may reach, every decision signed). Add
+`--llm-listen` and the same process also serves a **plain-HTTP OpenAI / Anthropic API
+pass-through**: point a client's base URL at it and every prompt and every reply is scanned for
+secrets and PII — and redacted, denied, or allowed — *before* the body leaves the gateway.
+
+```bash
+cargo install kriya --bin kriya-gateway --no-default-features --features mcp-client,mcp-http,contain
+
+kriya-gateway egress --listen 127.0.0.1:15080 --llm-listen 127.0.0.1:15081 --policy agent-policy.yaml
+#   optional: --llm-upstream openai=https://api.openai.com,anthropic=https://api.anthropic.com
+
+export OPENAI_BASE_URL=http://127.0.0.1:15081/v1      # openai SDKs, LangChain, …
+export ANTHROPIC_BASE_URL=http://127.0.0.1:15081      # anthropic SDKs, Claude Code, …
+```
+
+Routing is by path: `/v1/messages*` goes to the Anthropic upstream, every other `/v1/…` path to the
+OpenAI upstream. API keys travel in the client's own headers and pass straight through — they are
+never logged or receipted. The provider host is checked against the **same** `egress:` tier the
+CONNECT lane uses (a denied host is a 403 plus the usual egress deny receipt). The policy grows one
+optional section; absent, it defaults to redacting both directions for both providers:
+
+```yaml
+llm:
+  request: redact      # redact | deny | allow — on a secret/PII match in the prompt
+  response: redact     # redact | deny | allow — on a match in the model's reply
+  providers: [openai, anthropic]
+```
+
+`redact` here **rewrites** the matched text to `[REDACTED <type>]` in the message text fields
+(chat `messages[].content`, Responses `input`, Anthropic `system`/`messages[].content`, and the
+reply's text). A match anywhere else in the body (a tool-call argument, a metadata field) is denied
+rather than forwarded — fail closed. `detection.canary_tokens` are always denied in both
+directions. Detected shapes: AWS keys, GitHub PATs, JWTs, PEM private keys, email, card numbers
+(Luhn, spaced or dashed), US SSN, Aadhaar (Verhoeff) and Indian PAN. Denials come back as a 403 in
+the provider's own error shape, so SDKs raise a clean exception. Every request signs one
+content-free `kriya.io.llm.request` receipt (`decision`, match *types*, a sha256 of the forwarded
+body, sizes, latency) — plus `kriya.io.llm.deny` with the reason when refused — on the egress
+chain.
+
+> **Bypass honesty.** Only clients pointed at the listener are governed; a process that calls the
+> provider directly never passes through it. Pair it with `egress:` rules that deny the provider
+> hosts on the CONNECT lane to close that path. **Streaming responses are buffered**: the reply is
+> scanned whole and released (or re-emitted redacted, as one chunk) only once the upstream has
+> finished, so clients see no token-by-token streaming through this lane. The detector is a closed
+> set of patterns, not a classifier — it will miss PII that has no fixed shape (names, addresses).
 
 ## Deterministic execution — `kriya-run-wasm` (F4)
 

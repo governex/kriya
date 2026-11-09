@@ -166,6 +166,13 @@ pub struct Policy {
     /// `gates.rules` list is the enforcement truth.
     #[serde(default)]
     gates: Option<GatePolicy>,
+    /// Optional **governed LLM lane** policy (`kriya-gateway egress --llm-listen`): what the
+    /// plain-HTTP LLM pass-through does on a secret/PII match in a prompt or a reply
+    /// (`redact | deny | allow`) and which providers it may forward to. Absent ⇒ the lane runs
+    /// with [`LlmPolicy::default`] (redact both directions, both providers) and nothing else in the
+    /// engine changes — the same BC discipline every optional section above established.
+    #[serde(default)]
+    llm: Option<LlmPolicy>,
 }
 
 impl Default for Policy {
@@ -208,6 +215,7 @@ impl Default for Policy {
             memory: None,
             temporal: None,
             gates: None,
+            llm: None,
         }
     }
 }
@@ -300,6 +308,12 @@ impl Policy {
     /// with [`ModelPolicy::default`] (`unknown_model: warn`) rather than any stricter posture.
     pub fn model(&self) -> Option<&ModelPolicy> {
         self.model.as_ref()
+    }
+
+    /// The governed LLM lane policy (`kriya-gateway egress --llm-listen`), if configured. `None` →
+    /// the lane applies [`LlmPolicy::default`].
+    pub fn llm(&self) -> Option<&LlmPolicy> {
+        self.llm.as_ref()
     }
 
     /// The endpoint budget gate (C2, doc 27 §4), if configured. `None` → the hook `pre` lane
@@ -504,6 +518,7 @@ pub fn default_broker_policy(namespaces: &[String]) -> Policy {
         memory: None,
         temporal: None,
         gates: None,
+        llm: None,
     }
 }
 
@@ -562,6 +577,7 @@ pub fn default_proxy_policy() -> Policy {
         memory: None,
         temporal: None,
         gates: None,
+        llm: None,
     }
 }
 
@@ -1243,6 +1259,81 @@ pub struct SecretPiiPolicy {
     pub action: RedactOrDeny,
 }
 
+/// What the governed LLM lane does when the secret/PII detector matches a prompt (`request`) or a
+/// model reply (`response`). Unlike the tool lane's [`RedactOrDeny`] — where `redact` is
+/// receipt-side only — `redact` here REWRITES the matched text to `[REDACTED <type>]` before the
+/// body leaves the gateway. `allow` forwards unchanged and only records the match types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmContentAction {
+    #[default]
+    Redact,
+    Deny,
+    Allow,
+}
+
+impl LlmContentAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LlmContentAction::Redact => "redact",
+            LlmContentAction::Deny => "deny",
+            LlmContentAction::Allow => "allow",
+        }
+    }
+}
+
+/// An upstream LLM API family the governed LLM lane can forward to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmProvider {
+    Openai,
+    Anthropic,
+}
+
+impl LlmProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LlmProvider::Openai => "openai",
+            LlmProvider::Anthropic => "anthropic",
+        }
+    }
+}
+
+fn default_llm_providers() -> Vec<LlmProvider> {
+    vec![LlmProvider::Openai, LlmProvider::Anthropic]
+}
+
+/// The optional `llm:` policy section for `kriya-gateway egress --llm-listen`. Every key is
+/// optional; an unknown key or value is a parse error (a typo in a redaction posture must never
+/// silently fall back). `detection.canary_tokens` are always-deny in both directions regardless of
+/// this section.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmPolicy {
+    #[serde(default)]
+    pub request: LlmContentAction,
+    #[serde(default)]
+    pub response: LlmContentAction,
+    #[serde(default = "default_llm_providers")]
+    pub providers: Vec<LlmProvider>,
+}
+
+impl Default for LlmPolicy {
+    fn default() -> Self {
+        LlmPolicy {
+            request: LlmContentAction::default(),
+            response: LlmContentAction::default(),
+            providers: default_llm_providers(),
+        }
+    }
+}
+
+impl LlmPolicy {
+    pub fn allows_provider(&self, p: LlmProvider) -> bool {
+        self.providers.contains(&p)
+    }
+}
+
 /// B7 scan: which secret/PII shapes matched `payload` (the canonical-JSON outbound body), by TYPE
 /// name only. Byte-level scanning throughout (never a `&str` slice at an arbitrary offset) so this
 /// can never panic on attacker-controlled UTF-8 — every helper below only ever compares/indexes
@@ -1251,33 +1342,61 @@ pub struct SecretPiiPolicy {
 /// hash-only rule, applied here as *no value at all*, not even hashed).
 pub fn scan_secrets_pii(payload: &str) -> Vec<&'static str> {
     let b = payload.as_bytes();
-    let mut hits = Vec::new();
-    if has_fixed_prefix_token(b, b"AKIA", 16, is_upper_alnum) {
-        hits.push("aws_access_key");
-    }
-    if has_fixed_prefix_token(b, b"ghp_", 36, is_alnum) {
-        hits.push("github_pat");
-    }
-    if has_jwt(b) {
-        hits.push("jwt");
-    }
-    if contains(b, b"-----BEGIN") && contains(b, b"PRIVATE KEY") {
-        hits.push("private_key");
-    }
-    if has_email(b) {
-        hits.push("email");
-    }
-    if has_luhn_card(b) {
-        hits.push("credit_card");
-    }
-    if has_ssn(b) {
-        hits.push("ssn");
-    }
-    hits
+    DETECTORS
+        .iter()
+        .filter(|(_, spans)| !spans(b).is_empty())
+        .map(|(name, _)| *name)
+        .collect()
 }
 
+/// B7 scan, span-reporting form: every secret/PII match in `payload` as `(byte range, type)`,
+/// sorted by start offset. Same matchers as [`scan_secrets_pii`] (that function is exactly "the
+/// distinct types this returns, in detector order"). Ranges always start on an ASCII byte and end
+/// just after one, so they are valid `str` char boundaries; ranges of different types may overlap
+/// (a caller rewriting text should merge them). Used by the governed LLM lane to rewrite matched
+/// text to `[REDACTED <type>]` before a body leaves — the one place a range is ever needed; the
+/// matched value itself is still never copied out of the caller's buffer here.
+pub fn scan_secrets_pii_spans(payload: &str) -> Vec<(std::ops::Range<usize>, &'static str)> {
+    let b = payload.as_bytes();
+    let mut out: Vec<(std::ops::Range<usize>, &'static str)> = DETECTORS
+        .iter()
+        .flat_map(|(name, spans)| spans(b).into_iter().map(move |r| (r, *name)))
+        .collect();
+    out.sort_by_key(|(r, _)| (r.start, r.end));
+    out
+}
+
+type SpanFn = fn(&[u8]) -> Vec<std::ops::Range<usize>>;
+
+/// The closed detector set, in reporting order. Each entry reports byte ranges; the boolean
+/// [`scan_secrets_pii`] is "any range at all".
+const DETECTORS: &[(&str, SpanFn)] = &[
+    ("aws_access_key", |b| {
+        fixed_prefix_token_spans(b, b"AKIA", 16, is_upper_alnum)
+    }),
+    ("github_pat", |b| fixed_prefix_token_spans(b, b"ghp_", 36, is_alnum)),
+    ("jwt", jwt_spans),
+    ("private_key", private_key_spans),
+    ("email", email_spans),
+    ("credit_card", card_spans),
+    ("ssn", ssn_spans),
+    ("aadhaar", aadhaar_spans),
+    ("pan_in", pan_in_spans),
+];
+
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+    find_from(hay, needle, 0).is_some()
+}
+
+/// First index `>= from` where `needle` occurs in `hay`.
+fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= hay.len() || hay.len() - from < needle.len() {
+        return None;
+    }
+    hay[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
 }
 
 fn is_upper_alnum(c: u8) -> bool {
@@ -1288,25 +1407,37 @@ fn is_alnum(c: u8) -> bool {
     c.is_ascii_alphanumeric()
 }
 
-/// True if `prefix` appears anywhere in `b` followed immediately by exactly `tail_len` bytes all
-/// satisfying `tail_ok` (e.g. an AWS key: `AKIA` + 16 upper-alnum chars).
-fn has_fixed_prefix_token(
+/// Every place `prefix` appears in `b` followed immediately by at least `tail_len` bytes all
+/// satisfying `tail_ok` (e.g. an AWS key: `AKIA` + 16 upper-alnum chars). The match condition is
+/// "exactly `tail_len` qualifying bytes follow"; the reported range extends over any further
+/// qualifying bytes so a rewrite never leaves a tail of the token behind.
+fn fixed_prefix_token_spans(
     b: &[u8],
     prefix: &[u8],
     tail_len: usize,
     tail_ok: fn(u8) -> bool,
-) -> bool {
+) -> Vec<std::ops::Range<usize>> {
     let plen = prefix.len();
+    let mut out = Vec::new();
     if b.len() < plen + tail_len {
-        return false;
+        return out;
     }
-    (0..=b.len() - plen - tail_len).any(|i| {
-        &b[i..i + plen] == prefix
+    let mut i = 0;
+    while i + plen + tail_len <= b.len() {
+        if &b[i..i + plen] == prefix
             && b[i + plen..i + plen + tail_len]
                 .iter()
                 .copied()
                 .all(tail_ok)
-    })
+        {
+            let end = walk_while(b, i + plen + tail_len, tail_ok);
+            out.push(i..end);
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 fn is_b64url(c: u8) -> bool {
@@ -1316,7 +1447,8 @@ fn is_b64url(c: u8) -> bool {
 /// A JWT: three dot-separated base64url segments, the first starting `eyJ` (base64 for `{"`) — a
 /// strong anchor that keeps this from firing on an ordinary dotted token or version string. Minimum
 /// segment lengths are conservative (a real header/payload/signature are all comfortably longer).
-fn has_jwt(b: &[u8]) -> bool {
+fn jwt_spans(b: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i + 3 <= b.len() {
         if &b[i..i + 3] == b"eyJ" {
@@ -1328,14 +1460,39 @@ fn has_jwt(b: &[u8]) -> bool {
                     let seg3_start = seg2_end + 1;
                     let seg3_end = walk_while(b, seg3_start, is_b64url);
                     if seg3_end >= seg3_start + 5 {
-                        return true;
+                        out.push(i..seg3_end);
+                        i = seg3_end;
+                        continue;
                     }
                 }
             }
         }
         i += 1;
     }
-    false
+    out
+}
+
+/// A PEM private key: the payload carries both `-----BEGIN` and `PRIVATE KEY` (the original
+/// boolean rule). Each `-----BEGIN` block is reported from its marker through the closing
+/// `-----END …-----` line, or to the end of the payload when the block is unterminated.
+fn private_key_spans(b: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    if !(contains(b, b"-----BEGIN") && contains(b, b"PRIVATE KEY")) {
+        return out;
+    }
+    let mut from = 0;
+    while let Some(start) = find_from(b, b"-----BEGIN", from) {
+        let end = match find_from(b, b"-----END", start + 10) {
+            Some(e) => match find_from(b, b"-----", e + 8) {
+                Some(close) => close + 5,
+                None => b.len(),
+            },
+            None => b.len(),
+        };
+        out.push(start..end);
+        from = end;
+    }
+    out
 }
 
 fn walk_while(b: &[u8], mut i: usize, pred: fn(u8) -> bool) -> usize {
@@ -1345,22 +1502,31 @@ fn walk_while(b: &[u8], mut i: usize, pred: fn(u8) -> bool) -> usize {
     i
 }
 
+fn is_email_local(c: u8) -> bool {
+    matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'+' | b'-' | b'_')
+}
+
 /// A conservative `local@domain.tld` shape: at least one local-part char, a domain of word chars and
-/// dots, a final label of 2+ letters.
-fn has_email(b: &[u8]) -> bool {
+/// dots, a final label of 2+ letters. Trailing `.`/`-` after the domain is treated as punctuation.
+fn email_spans(b: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
     for (idx, &c) in b.iter().enumerate() {
         if c != b'@' {
             continue;
         }
-        let local_ok = idx > 0
-            && matches!(b[idx - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'+' | b'-' | b'_');
+        let local_ok = idx > 0 && is_email_local(b[idx - 1]);
         if !local_ok {
             continue;
         }
         let dom_start = idx + 1;
-        let dom_end = walk_while(b, dom_start, |c| {
+        let mut dom_end = walk_while(b, dom_start, |c| {
             c.is_ascii_alphanumeric() || c == b'.' || c == b'-'
         });
+        // A sentence-final `.` (or a stray trailing `-`) is punctuation, not part of the domain:
+        // `mail jane@example.com.` must still match.
+        while dom_end > dom_start && matches!(b[dom_end - 1], b'.' | b'-') {
+            dom_end -= 1;
+        }
         let domain = &b[dom_start..dom_end];
         if domain.len() < 4 {
             continue;
@@ -1368,32 +1534,94 @@ fn has_email(b: &[u8]) -> bool {
         if let Some(dot) = domain.iter().rposition(|&c| c == b'.') {
             let tld = &domain[dot + 1..];
             if tld.len() >= 2 && tld.iter().all(u8::is_ascii_alphabetic) {
-                return true;
+                let mut local_start = idx;
+                while local_start > 0 && is_email_local(b[local_start - 1]) {
+                    local_start -= 1;
+                }
+                // Never start a span inside a previous one (`a@b.co@c.org`-style runs).
+                if out
+                    .last()
+                    .map_or(true, |r: &std::ops::Range<usize>| local_start >= r.end)
+                {
+                    out.push(local_start..dom_end);
+                }
             }
         }
     }
-    false
+    out
 }
 
-/// A 13–19 digit run that passes the Luhn checksum (the standard card-number DLP heuristic — Luhn's
-/// own ~1-in-10 accept rate on random digits is an inherent property of the checksum, not a flaw
-/// here; it is what every mainstream DLP tool uses for exactly this shape).
-fn has_luhn_card(b: &[u8]) -> bool {
+/// A maximal run of digit groups joined by single spaces/dashes (`4111 1111 1111 1111`,
+/// `2345-6789-0124`, or one bare group). `groups` are the byte ranges of the digit groups.
+struct DigitRun {
+    groups: Vec<std::ops::Range<usize>>,
+}
+
+impl DigitRun {
+    fn span(&self) -> std::ops::Range<usize> {
+        self.groups[0].start..self.groups[self.groups.len() - 1].end
+    }
+    fn digits(&self, b: &[u8]) -> Vec<u8> {
+        self.groups
+            .iter()
+            .flat_map(|g| b[g.clone()].iter().copied())
+            .collect()
+    }
+    fn digit_count(&self) -> usize {
+        self.groups.iter().map(|g| g.end - g.start).sum()
+    }
+}
+
+fn digit_runs(b: &[u8]) -> Vec<DigitRun> {
+    let mut runs = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        if b[i].is_ascii_digit() {
-            let start = i;
-            let end = walk_while(b, i, |c| c.is_ascii_digit());
-            let len = end - start;
-            if (13..=19).contains(&len) && luhn_valid(&b[start..end]) {
-                return true;
-            }
-            i = end;
-        } else {
+        if !b[i].is_ascii_digit() {
             i += 1;
+            continue;
+        }
+        let mut groups = Vec::new();
+        let mut start = i;
+        loop {
+            let end = walk_while(b, start, |c| c.is_ascii_digit());
+            groups.push(start..end);
+            if end + 1 < b.len()
+                && (b[end] == b' ' || b[end] == b'-')
+                && b[end + 1].is_ascii_digit()
+            {
+                start = end + 1;
+            } else {
+                i = end;
+                break;
+            }
+        }
+        runs.push(DigitRun { groups });
+    }
+    runs
+}
+
+/// A card number: a 13–19 digit run passing the Luhn checksum (the standard card-number DLP
+/// heuristic — Luhn's own ~1-in-10 accept rate on random digits is an inherent property of the
+/// checksum, not a flaw here; it is what every mainstream DLP tool uses for exactly this shape).
+/// Either one unbroken digit run (the original rule, unchanged) or a whole run of digit groups
+/// joined by single spaces/dashes (`4111 1111 1111 1111`, `4111-1111-1111-1111`).
+fn card_spans(b: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    for run in digit_runs(b) {
+        if run.groups.len() >= 2
+            && (13..=19).contains(&run.digit_count())
+            && luhn_valid(&run.digits(b))
+        {
+            out.push(run.span());
+            continue;
+        }
+        for g in &run.groups {
+            if (13..=19).contains(&(g.end - g.start)) && luhn_valid(&b[g.clone()]) {
+                out.push(g.clone());
+            }
         }
     }
-    false
+    out
 }
 
 fn luhn_valid(digits: &[u8]) -> bool {
@@ -1413,21 +1641,110 @@ fn luhn_valid(digits: &[u8]) -> bool {
     sum % 10 == 0
 }
 
+/// An Aadhaar number (India's 12-digit resident ID): a whole digit run that is either 12 bare
+/// digits or three 4-digit groups joined by single spaces/dashes, first digit 2–9 (UIDAI never
+/// issues 0/1-leading numbers), passing the Verhoeff checksum, and not touching a letter or digit
+/// on either side (so a 12-digit slice of a longer identifier never fires).
+fn aadhaar_spans(b: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    for run in digit_runs(b) {
+        let shape_ok = match run.groups.len() {
+            1 => run.digit_count() == 12,
+            3 => run.groups.iter().all(|g| g.end - g.start == 4),
+            _ => false,
+        };
+        if !shape_ok {
+            continue;
+        }
+        let span = run.span();
+        let bounded = (span.start == 0 || !b[span.start - 1].is_ascii_alphanumeric())
+            && (span.end >= b.len() || !b[span.end].is_ascii_alphanumeric());
+        let digits = run.digits(b);
+        if bounded && (b'2'..=b'9').contains(&digits[0]) && verhoeff_valid(&digits) {
+            out.push(span);
+        }
+    }
+    out
+}
+
+/// The Verhoeff checksum (dihedral group D5) — valid iff the running check over the reversed digit
+/// string ends at 0. Catches every single-digit error and every adjacent transposition.
+fn verhoeff_valid(digits: &[u8]) -> bool {
+    const D: [[u8; 10]; 10] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
+        [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+        [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
+        [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
+        [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+        [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
+        [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
+        [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+        [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+    ];
+    const P: [[u8; 10]; 8] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
+        [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+        [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
+        [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
+        [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+        [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
+        [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
+    ];
+    let mut c = 0u8;
+    for (i, &d) in digits.iter().rev().enumerate() {
+        if !d.is_ascii_digit() {
+            return false;
+        }
+        c = D[c as usize][P[i % 8][(d - b'0') as usize] as usize];
+    }
+    c == 0
+}
+
+/// An Indian PAN (Permanent Account Number): `[A-Z]{5}[0-9]{4}[A-Z]` whose 4th letter is a valid
+/// holder-type code (`P C H F A T B L J G`), bounded by non-alphanumerics on both sides.
+fn pan_in_spans(b: &[u8]) -> Vec<std::ops::Range<usize>> {
+    const HOLDER: &[u8] = b"PCHFATBLJG";
+    let mut out = Vec::new();
+    if b.len() < 10 {
+        return out;
+    }
+    for i in 0..=b.len() - 10 {
+        let w = &b[i..i + 10];
+        if w[..5].iter().all(u8::is_ascii_uppercase)
+            && HOLDER.contains(&w[3])
+            && w[5..9].iter().all(u8::is_ascii_digit)
+            && w[9].is_ascii_uppercase()
+            && (i == 0 || !b[i - 1].is_ascii_alphanumeric())
+            && (i + 10 >= b.len() || !b[i + 10].is_ascii_alphanumeric())
+        {
+            out.push(i..i + 10);
+        }
+    }
+    out
+}
+
 /// `\d{3}-\d{2}-\d{4}` not immediately bordered by another digit (so it doesn't fire inside a longer
 /// dash-delimited digit run, e.g. a tracking or account number).
-fn has_ssn(b: &[u8]) -> bool {
+fn ssn_spans(b: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
     if b.len() < 11 {
-        return false;
+        return out;
     }
-    (0..=b.len() - 11).any(|i| {
-        b[i..i + 3].iter().all(u8::is_ascii_digit)
+    for i in 0..=b.len() - 11 {
+        if b[i..i + 3].iter().all(u8::is_ascii_digit)
             && b[i + 3] == b'-'
             && b[i + 4..i + 6].iter().all(u8::is_ascii_digit)
             && b[i + 6] == b'-'
             && b[i + 7..i + 11].iter().all(u8::is_ascii_digit)
             && (i == 0 || !b[i - 1].is_ascii_digit())
             && (i + 11 >= b.len() || !b[i + 11].is_ascii_digit())
-    })
+        {
+            out.push(i..i + 11);
+        }
+    }
+    out
 }
 
 /// B9: the first configured canary token that appears verbatim in `payload`, if any. Canary tokens
@@ -4371,5 +4688,160 @@ budgets:
         let p: Policy = serde_yaml::from_str("rules:\n  - action: \"*\"\n    allow: true\nmemory: []\n").unwrap();
         assert!(p.memory().is_some(), "explicitly empty ⇒ Some(&[]), distinct from absent");
         assert_eq!(p.memory().unwrap().len(), 0);
+    }
+
+    // ── governed LLM lane: span scanner, new detectors, `llm:` section ──────────────────────
+
+    fn types(s: &str) -> Vec<&'static str> {
+        scan_secrets_pii(s)
+    }
+
+    #[test]
+    fn aadhaar_verhoeff_shapes() {
+        for ok in ["234567890124", "2345 6789 0124", "7890-1234-5674", "id: 234567890124."] {
+            assert!(types(ok).contains(&"aadhaar"), "{ok} should match aadhaar");
+        }
+        for bad in [
+            "234567890125",   // checksum fails
+            "1234 5678 9012", // phone-like, leading 1
+            "034567890124",   // leading 0
+            "x234567890124",  // glued to a word
+            "2345678901241",  // 13 digits
+            "2345 67890 124", // wrong grouping
+        ] {
+            assert!(!types(bad).contains(&"aadhaar"), "{bad} must not match aadhaar");
+        }
+    }
+
+    #[test]
+    fn email_followed_by_sentence_punctuation_still_matches() {
+        let t = "write to jane.doe@example.com. Thanks";
+        assert!(types(t).contains(&"email"));
+        let spans = scan_secrets_pii_spans(t);
+        assert_eq!(&t[spans[0].0.clone()], "jane.doe@example.com");
+        assert!(!types("a@b.c.").contains(&"email"));
+    }
+
+    #[test]
+    fn pan_in_shape() {
+        assert!(types("PAN ABCPE1234F on file").contains(&"pan_in"));
+        assert!(types("ABCPE1234F").contains(&"pan_in"));
+        assert!(!types("ABCDE1234F").contains(&"pan_in"), "4th letter D is not a holder type");
+        assert!(!types("XABCPE1234F").contains(&"pan_in"), "word boundary");
+        assert!(!types("ABCPE1234FX").contains(&"pan_in"), "word boundary");
+        assert!(!types("abcpe1234f").contains(&"pan_in"));
+    }
+
+    #[test]
+    fn credit_card_tolerates_single_space_or_dash_groups() {
+        for ok in [
+            "4111111111111111",
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "card: 4111 1111 1111 1111.",
+        ] {
+            assert!(types(ok).contains(&"credit_card"), "{ok}");
+        }
+        assert!(!types("4111 1111 1111 1112").contains(&"credit_card"), "Luhn still applies");
+        assert!(!types("4111  1111 1111 1111").contains(&"credit_card"), "double space splits the run");
+        assert!(!types("2024-01-15 call 555-0100").contains(&"credit_card"));
+    }
+
+    #[test]
+    fn spans_report_byte_ranges_for_every_type() {
+        let text = "a jane@example.com b 4111 1111 1111 1111 c 123-45-6789 d 2345 6789 0124 \
+                    e ABCPE1234F f AKIAABCDEFGHIJKLMNOP g ghp_abcdefghijklmnopqrstuvwxyz0123456789 h";
+        let spans = scan_secrets_pii_spans(text);
+        let got: Vec<(&str, &str)> = spans.iter().map(|(r, t)| (*t, &text[r.clone()])).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("email", "jane@example.com"),
+                ("credit_card", "4111 1111 1111 1111"),
+                ("ssn", "123-45-6789"),
+                ("aadhaar", "2345 6789 0124"),
+                ("pan_in", "ABCPE1234F"),
+                ("aws_access_key", "AKIAABCDEFGHIJKLMNOP"),
+                ("github_pat", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+            ]
+        );
+        // The boolean scanner is exactly "the distinct types the span scanner reports".
+        let mut distinct: Vec<&str> = Vec::new();
+        for (_, t) in &spans {
+            if !distinct.contains(t) {
+                distinct.push(t);
+            }
+        }
+        let mut b = scan_secrets_pii(text);
+        b.sort();
+        distinct.sort();
+        assert_eq!(b, distinct);
+    }
+
+    #[test]
+    fn spans_cover_jwt_and_pem_blocks() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N";
+        let t = format!("tok {jwt} end");
+        let spans = scan_secrets_pii_spans(&t);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&t[spans[0].0.clone()], jwt);
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----";
+        let t = format!("x {pem} y");
+        let spans = scan_secrets_pii_spans(&t);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1, "private_key");
+        assert_eq!(&t[spans[0].0.clone()], pem);
+    }
+
+    #[test]
+    fn scanners_are_panic_free_on_arbitrary_utf8() {
+        let nasty = "é@ü.中文 ☃4111 1111 ✓ -----BEGIN 鍵 PRIVATE KEY eyJé.é. AKIA☃ 2345 6789 0124é";
+        let _ = scan_secrets_pii(nasty);
+        for (r, _) in scan_secrets_pii_spans(nasty) {
+            assert!(nasty.is_char_boundary(r.start) && nasty.is_char_boundary(r.end));
+        }
+        for i in 0..nasty.len() {
+            if nasty.is_char_boundary(i) {
+                let _ = scan_secrets_pii_spans(&nasty[i..]);
+                let _ = scan_secrets_pii_spans(&nasty[..i]);
+            }
+        }
+    }
+
+    #[test]
+    fn llm_section_absent_present_partial_invalid() {
+        let p = policy_from("rules: [{action: \"*\", allow: true}]\n");
+        assert!(p.llm().is_none(), "absent ⇒ None");
+        assert_eq!(LlmPolicy::default().request, LlmContentAction::Redact);
+        assert_eq!(LlmPolicy::default().response, LlmContentAction::Redact);
+        assert!(LlmPolicy::default().allows_provider(LlmProvider::Openai));
+        assert!(LlmPolicy::default().allows_provider(LlmProvider::Anthropic));
+
+        let p = policy_from(
+            "rules: [{action: \"*\", allow: true}]\nllm:\n  request: deny\n  response: allow\n  providers: [anthropic]\n",
+        );
+        let l = p.llm().unwrap();
+        assert_eq!(l.request, LlmContentAction::Deny);
+        assert_eq!(l.response, LlmContentAction::Allow);
+        assert!(!l.allows_provider(LlmProvider::Openai));
+        assert!(l.allows_provider(LlmProvider::Anthropic));
+
+        let p = policy_from("rules: [{action: \"*\", allow: true}]\nllm:\n  response: deny\n");
+        let l = p.llm().unwrap();
+        assert_eq!(l.request, LlmContentAction::Redact, "partial ⇒ defaults fill in");
+        assert_eq!(l.response, LlmContentAction::Deny);
+        assert_eq!(l.providers.len(), 2);
+
+        for bad in [
+            "llm:\n  request: scrub\n",
+            "llm:\n  providers: [gemini]\n",
+            "llm:\n  requests: deny\n",
+        ] {
+            let yaml = format!("rules: [{{action: \"*\", allow: true}}]\n{bad}");
+            assert!(
+                serde_yaml::from_str::<Policy>(&yaml).is_err(),
+                "invalid llm section must be a parse error: {bad}"
+            );
+        }
     }
 }
