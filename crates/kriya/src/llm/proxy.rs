@@ -8,7 +8,7 @@
 //! **Bypass honesty**: this proxy governs ONLY clients pointed at it — see `llm/mod.rs`'s module doc.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +22,9 @@ use crate::audit::{now_ms, Actor, Receipt, Signer};
 use crate::permissions::ModelPolicy;
 
 use super::{manifest, receipts};
+use crate::http1::{
+    self, collect_headers, read_request, status_text, write_response_head, ParsedRequest,
+};
 
 /// Governed endpoints: OpenAI-compatible chat/completions/embeddings + Ollama-native chat/generate.
 /// Every other path/method is relayed transparently (no receipts) — a client that speaks to, say,
@@ -49,10 +52,6 @@ const SAMPLER_KEYS: &[&str] = &[
     "repeat_penalty",
     "stop",
 ];
-
-/// A generous but bounded request-body cap (prompts/embedding batches, never a model weight file —
-/// those are read only by [`manifest::compute_and_cache_digest`], off this path entirely).
-const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Where `kriya-llm-proxy` resolves model identities from — see [`manifest`].
 pub struct ProxyOptions {
@@ -240,113 +239,8 @@ fn seen_key(model: &str, digest: &str) -> String {
 
 // ─── HTTP parsing (request side) ────────────────────────────────────────────────────────────────
 
-struct ParsedRequest {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-/// Read one HTTP/1.1 request from `reader`. `Ok(None)` means the client closed the connection
-/// before sending anything (a normal end-of-connection, not an error — this proxy is one-request-
-/// per-connection, so every keep-alive-less client hits this on its next reconnect).
-fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<ParsedRequest>> {
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(None);
-    }
-    let trimmed = request_line.trim_end_matches(['\r', '\n']);
-    let mut parts = trimmed.splitn(3, ' ');
-    let (Some(method), Some(path), Some(_version)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return Ok(None);
-    };
-    let method = method.to_string();
-    let path = path.to_string();
-
-    let mut headers = Vec::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
-        }
-    }
-
-    let content_length = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse::<usize>().ok());
-    let chunked = headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
-    });
-
-    let body = if chunked {
-        read_chunked_body(reader)?
-    } else if let Some(len) = content_length {
-        if len > MAX_BODY_BYTES {
-            return Err(too_large_error());
-        }
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf)?;
-        buf
-    } else {
-        Vec::new()
-    };
-
-    Ok(Some(ParsedRequest {
-        method,
-        path,
-        headers,
-        body,
-    }))
-}
-
-fn too_large_error() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "request body exceeds the size cap",
-    )
-}
-
-fn read_chunked_body(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        let mut size_line = String::new();
-        if reader.read_line(&mut size_line)? == 0 {
-            break;
-        }
-        let size_str = size_line.trim().split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_str, 16).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed chunk size")
-        })?;
-        if size == 0 {
-            // Consume trailing header lines up to the final blank line.
-            loop {
-                let mut trailer = String::new();
-                if reader.read_line(&mut trailer)? == 0 || trailer.trim().is_empty() {
-                    break;
-                }
-            }
-            break;
-        }
-        if out.len() + size > MAX_BODY_BYTES {
-            return Err(too_large_error());
-        }
-        let mut chunk = vec![0u8; size];
-        reader.read_exact(&mut chunk)?;
-        out.extend_from_slice(&chunk);
-        let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf)?; // the chunk's trailing CRLF
-    }
-    Ok(out)
-}
+// `ParsedRequest` / `read_request` / chunked decoding live in `crate::http1` (shared with the
+// governed LLM lane of `kriya-gateway egress`).
 
 // ─── Connection handling ────────────────────────────────────────────────────────────────────────
 
@@ -538,10 +432,7 @@ fn transparent_relay(writer: &mut TcpStream, req: &ParsedRequest, ctx: &ConnCtx)
     let _ = relay_response_and_hash(&mut body_reader, writer);
 }
 
-// `ureq::Error::Status` carries a full `Response` (the caller needs it — see the call sites'
-// `Err(ureq::Error::Status(_, r)) => r` arms, which relay the real upstream response instead of
-// masking it as a generic 502) — same intentional-large-Err shape `audit::Signer::record_persisted`
-// already accepts for the same reason.
+// See `crate::http1::forward` for why the large `Err` is intentional.
 #[allow(clippy::result_large_err)]
 fn forward_upstream(
     agent: &ureq::Agent,
@@ -549,51 +440,7 @@ fn forward_upstream(
     req: &ParsedRequest,
 ) -> Result<ureq::Response, ureq::Error> {
     let url = format!("{}{}", upstream.trim_end_matches('/'), req.path);
-    let mut r = agent.request(&req.method, &url);
-    for (k, v) in &req.headers {
-        let kl = k.to_ascii_lowercase();
-        if matches!(
-            kl.as_str(),
-            "host" | "content-length" | "transfer-encoding" | "connection"
-        ) {
-            continue;
-        }
-        r = r.set(k, v);
-    }
-    if req.body.is_empty() {
-        r.call()
-    } else {
-        r.send_bytes(&req.body)
-    }
-}
-
-fn collect_headers(resp: &ureq::Response) -> Vec<(String, String)> {
-    resp.headers_names()
-        .into_iter()
-        .filter(|n| {
-            let nl = n.to_ascii_lowercase();
-            !matches!(
-                nl.as_str(),
-                "content-length" | "transfer-encoding" | "connection"
-            )
-        })
-        .filter_map(|n| resp.header(&n).map(|v| (n.clone(), v.to_string())))
-        .collect()
-}
-
-fn write_response_head(
-    writer: &mut impl Write,
-    status: u16,
-    headers: &[(String, String)],
-) -> std::io::Result<()> {
-    write!(writer, "HTTP/1.1 {status} {}\r\n", status_text(status))?;
-    for (k, v) in headers {
-        write!(writer, "{k}: {v}\r\n")?;
-    }
-    write!(writer, "Transfer-Encoding: chunked\r\n")?;
-    write!(writer, "Connection: close\r\n")?;
-    write!(writer, "\r\n")?;
-    Ok(())
+    http1::forward(agent, &req.method, &url, &req.headers, &req.body, &[])
 }
 
 fn write_error(writer: &mut impl Write, status: u16, message: &str) -> std::io::Result<()> {
@@ -605,21 +452,6 @@ fn write_error(writer: &mut impl Write, status: u16, message: &str) -> std::io::
     write!(writer, "Connection: close\r\n\r\n")?;
     writer.write_all(body.as_bytes())?;
     Ok(())
-}
-
-fn status_text(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        413 => "Payload Too Large",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        504 => "Gateway Timeout",
-        _ => "Unknown",
-    }
 }
 
 /// Relay `upstream` to `client` byte-for-byte as HTTP chunked framing, hashing as it goes (never
@@ -775,7 +607,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::permissions::UnknownModelAction;
-    use std::io::Cursor;
+    use std::io::{BufRead, Cursor};
 
     // ── pure-function tests ──────────────────────────────────────────────────────────────────
 

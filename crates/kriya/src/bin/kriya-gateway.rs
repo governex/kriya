@@ -61,6 +61,22 @@
 //! `--audit-log <path>` to override (ad-hoc inspection, or a custom location). The directory is
 //! created on first write; the convention is shared with the Console via [`default_audit_dir`].
 //!
+//! ## Governed egress + LLM lane (`egress`)
+//! ```text
+//! kriya-gateway egress [--listen host:port] --policy <p.yaml with an egress: section>
+//!                      [--actor <a>] [--user <u>] [--audit-log <path>] [--signing-key <path>]
+//!                      [--llm-listen host:port [--llm-upstream openai=<url>,anthropic=<url>]]
+//! ```
+//! `egress` serves the governed CONNECT proxy on `--listen` (default `127.0.0.1:15080`) with no
+//! launched child. `--llm-listen` adds a plain-HTTP OpenAI/Anthropic API pass-through
+//! ([`kriya::mcp::LlmGateway`]) in the same process: clients set `OPENAI_BASE_URL=http://<addr>/v1`
+//! / `ANTHROPIC_BASE_URL=http://<addr>`; prompts and replies are scanned for secrets/PII and
+//! redacted, denied or allowed per the policy's optional `llm:` section, the provider host goes
+//! through the same `egress:` tier, and every request is receipted (`kriya.io.llm.request`,
+//! `kriya.io.llm.deny`) on the same signer/chain. Only clients pointed at the listener are governed;
+//! streaming replies are buffered whole before release. The policy is parsed strictly here — an
+//! invalid file is a startup error, not a silent fallback to the default policy.
+//!
 //! Banner + per-call decisions go to **stderr**; stdout is reserved for the MCP JSON-RPC stream.
 
 use std::path::{Path, PathBuf};
@@ -190,7 +206,10 @@ fn usage_and_exit(msg: &str) -> ! {
          \x20  (EG-C containment, macOS only: forces the launched agent's egress through the governed lane —\n       \
          \x20  see the honest ceiling in kriya::mcp::contain's module doc before selling this)\n       \
          kriya-gateway egress [--listen host:port] --policy <p.yaml with an egress: section> [same governance flags]\n       \
-         \x20  (standalone governed egress proxy, no launched child — the Linux sidecar lane)\n       \
+         \x20  [--llm-listen host:port [--llm-upstream openai=<url>,anthropic=<url>]]\n       \
+         \x20  (standalone governed egress proxy, no launched child — the Linux sidecar lane; --llm-listen adds\n       \
+         \x20  a plain-HTTP OpenAI/Anthropic pass-through that redacts/denies secrets+PII inline per the\n       \
+         \x20  policy's `llm:` section — only clients pointed at it are governed; streams are buffered)\n       \
          kriya-gateway serve ...   (delegates to the kriya-mcp bolt-on)"
     );
     exit(2);
@@ -1251,6 +1270,8 @@ fn run_egress(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
     let mut user: Option<String> = None;
     let mut audit_log: Option<PathBuf> = None;
     let mut signing_key: Option<PathBuf> = None;
+    let mut llm_listen: Option<String> = None;
+    let mut llm_upstream_specs: Vec<String> = Vec::new();
     while let Some(flag) = it.next() {
         let mut take = |label: &str| -> String {
             it.next()
@@ -1258,6 +1279,8 @@ fn run_egress(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
         };
         match flag.as_str() {
             "--listen" => listen = take("--listen"),
+            "--llm-listen" => llm_listen = Some(take("--llm-listen")),
+            "--llm-upstream" => llm_upstream_specs.push(take("--llm-upstream")),
             "--policy" => policy_path = Some(PathBuf::from(take("--policy"))),
             "--actor" => actor_flag = Some(take("--actor")),
             "--user" => user = Some(take("--user")),
@@ -1267,8 +1290,18 @@ fn run_egress(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
             other => usage_and_exit(&format!("unknown argument: {other}")),
         }
     }
-    let policy = match &policy_path {
-        Some(p) => Policy::load_or_default(p),
+    // Parsed strictly (not `load_or_default`): an unreadable or invalid policy is a startup error
+    // here — falling back to the built-in default would silently drop the `egress:`/`llm:`
+    // posture the operator wrote.
+    let policy: Policy = match &policy_path {
+        Some(p) => {
+            let text = std::fs::read_to_string(p).unwrap_or_else(|e| {
+                usage_and_exit(&format!("egress: cannot read policy {}: {e}", p.display()))
+            });
+            serde_yaml::from_str(&text).unwrap_or_else(|e| {
+                usage_and_exit(&format!("egress: invalid policy {}: {e}", p.display()))
+            })
+        }
         None => usage_and_exit("egress requires --policy <p.yaml> with an `egress:` section"),
     };
     let Some(egress_policy) = policy.egress().cloned() else {
@@ -1276,6 +1309,9 @@ fn run_egress(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
             "egress requires the policy to have an `egress:` section — see doc 24 §7.3 for the shape",
         )
     };
+    if llm_listen.is_none() && !llm_upstream_specs.is_empty() {
+        usage_and_exit("--llm-upstream only applies together with --llm-listen");
+    }
     for w in policy.warnings() {
         eprintln!("[kriya-gateway] policy warning: {w}");
     }
@@ -1289,7 +1325,7 @@ fn run_egress(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
     let scope_token = uuid::Uuid::new_v4().to_string();
     let proxy = match ConnectProxy::spawn_on(
         &listen,
-        egress_policy,
+        egress_policy.clone(),
         signer.clone(),
         actor.clone(),
         scope_token.clone(),
@@ -1297,16 +1333,33 @@ fn run_egress(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
         Ok(p) => p,
         Err(e) => usage_and_exit(&format!("egress: failed to bind {listen}: {e}")),
     };
+    // The governed LLM lane (optional): a plain-HTTP OpenAI/Anthropic pass-through on its own
+    // listener, same egress tier, same signer/chain, same scope token.
+    let _llm = llm_listen.as_ref().map(|addr| {
+        spawn_llm_lane(
+            addr,
+            &llm_upstream_specs,
+            &policy,
+            egress_policy.clone(),
+            signer.clone(),
+            actor.clone(),
+            scope_token.clone(),
+        )
+    });
+    let mut start_params = serde_json::json!({
+        "scope_token": scope_token,
+        "proxy_port": proxy.port(),
+        "listen": listen,
+        "downstream": ["egress-daemon"],
+    });
+    if let (Some(addr), serde_json::Value::Object(m)) = (&llm_listen, &mut start_params) {
+        m.insert("llm_listen".into(), serde_json::Value::String(addr.clone()));
+    }
     signer.record(
         Receipt::new(
             uuid::Uuid::new_v4().to_string(),
             RUN_START.to_string(),
-            serde_json::json!({
-                "scope_token": scope_token,
-                "proxy_port": proxy.port(),
-                "listen": listen,
-                "downstream": ["egress-daemon"],
-            }),
+            start_params,
             true,
             now_ms(),
         )
@@ -1316,10 +1369,67 @@ fn run_egress(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
         "[kriya-gateway] egress: governed proxy listening on {listen} · audit log={}",
         audit_log.display()
     );
+    if let Some(addr) = &llm_listen {
+        eprintln!(
+            "[kriya-gateway] egress: governed LLM lane listening on http://{addr} \
+             (OPENAI_BASE_URL=http://{addr}/v1 · ANTHROPIC_BASE_URL=http://{addr}) — only clients \
+             pointed here are governed"
+        );
+    }
     // Serve until the pod runtime stops the process; the proxy's own threads do the work.
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
+}
+
+/// Start the governed LLM lane (`egress --llm-listen`): `llm:` (or its defaults), the SAME egress
+/// tier, and `detection.canary_tokens` from the one policy file.
+#[cfg(all(feature = "contain", feature = "mcp-http"))]
+fn spawn_llm_lane(
+    addr: &str,
+    upstream_specs: &[String],
+    policy: &Policy,
+    egress_policy: kriya::permissions::EgressPolicy,
+    signer: Arc<Signer>,
+    actor: Option<Actor>,
+    scope_token: String,
+) -> kriya::mcp::LlmGateway {
+    use kriya::mcp::{LlmGateway, LlmGatewayConfig, LlmUpstreams};
+    let mut upstreams = LlmUpstreams::default();
+    for spec in upstream_specs {
+        if let Err(e) = upstreams.apply_spec(spec) {
+            usage_and_exit(&format!("--llm-upstream: {e}"));
+        }
+    }
+    let config = LlmGatewayConfig {
+        upstreams,
+        llm: policy.llm().cloned().unwrap_or_default(),
+        egress: egress_policy,
+        canary_tokens: policy
+            .detection()
+            .map(|d| d.canary_tokens.clone())
+            .unwrap_or_default(),
+    };
+    match LlmGateway::spawn_on(addr, config, signer, actor, scope_token) {
+        Ok(g) => g,
+        Err(e) => usage_and_exit(&format!("egress: failed to bind --llm-listen {addr}: {e}")),
+    }
+}
+
+/// Built with `contain` but WITHOUT `mcp-http` (no outbound HTTP client): the LLM lane is absent.
+#[cfg(all(feature = "contain", not(feature = "mcp-http")))]
+fn spawn_llm_lane(
+    _addr: &str,
+    _upstream_specs: &[String],
+    _policy: &Policy,
+    _egress_policy: kriya::permissions::EgressPolicy,
+    _signer: Arc<Signer>,
+    _actor: Option<Actor>,
+    _scope_token: String,
+) {
+    usage_and_exit(
+        "this gateway build has no LLM lane — rebuild with `--features mcp-client,mcp-http,contain`",
+    )
 }
 
 /// Built WITHOUT the `contain` feature: tell the operator how to get it.
