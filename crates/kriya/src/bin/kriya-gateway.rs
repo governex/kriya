@@ -185,7 +185,8 @@ fn usage_and_exit(msg: &str) -> ! {
         "usage: kriya-gateway proxy [--policy <p.yaml>] [--approval deny|tty|gui|auto|file] \
          [--actor <agent>] [--user <user>] [--audit-log <path>] [--signing-key <path>] \
          [--name <n>] -- <downstream-cmd> [args...]\n       \
-         kriya-gateway broker --config broker.yaml [same governance flags]   (ONE endpoint over N MCP upstreams, one governor)\n       \
+         kriya-gateway broker --config broker.yaml [same governance flags] [--listen host:port]   (ONE endpoint over N MCP upstreams, one governor)\n       \
+         \x20  (--listen: serve streamable-HTTP MCP at http://host:port/mcp instead of stdio — POST only, no GET stream)\n       \
          kriya-gateway run [--policy <p.yaml with an egress: section>] [same governance flags] -- <agent-cmd> [args...]\n       \
          \x20  (EG-C containment, macOS only: forces the launched agent's egress through the governed lane —\n       \
          \x20  see the honest ceiling in kriya::mcp::contain's module doc before selling this)\n       \
@@ -825,6 +826,7 @@ fn run_broker(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
     let mut user: Option<String> = None;
     let mut audit_log: Option<PathBuf> = None;
     let mut signing_key: Option<PathBuf> = None;
+    let mut listen: Option<String> = None;
 
     while let Some(flag) = it.next() {
         let mut take = |label: &str| -> String {
@@ -833,6 +835,7 @@ fn run_broker(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
         };
         match flag.as_str() {
             "--config" => config = Some(PathBuf::from(take("--config"))),
+            "--listen" => listen = Some(take("--listen")),
             "--policy" => policy = Some(PathBuf::from(take("--policy"))),
             "--approval" => approval = Some(take("--approval")),
             "--name" => name = Some(take("--name")),
@@ -1080,6 +1083,24 @@ fn run_broker(mut it: impl Iterator<Item = String>) -> std::io::Result<()> {
         actor_desc,
         signer.log_path().display()
     );
+
+    // `--listen` ⇒ streamable-HTTP MCP at `/mcp` (the sidecar lane); absent ⇒ the stdio loop,
+    // unchanged. This hop's origin-chain entry (C3) is the actor's agent label, or `broker`.
+    if let Some(listen) = listen {
+        let chain_actor = actor
+            .as_ref()
+            .map(|a| a.agent.clone())
+            .unwrap_or_else(|| "broker".to_string());
+        let (addr, handle) = kriya::mcp::http_serve::spawn(&listen, server, &chain_actor)
+            .unwrap_or_else(|e| usage_and_exit(&format!("broker: cannot listen on {listen}: {e}")));
+        eprintln!(
+            "[kriya-gateway] broker listening on http://{addr}{}",
+            kriya::mcp::http_serve::MCP_PATH
+        );
+        return handle
+            .join()
+            .map_err(|_| std::io::Error::other("broker http accept loop panicked"));
+    }
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

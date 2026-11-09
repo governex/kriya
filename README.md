@@ -109,6 +109,20 @@ gets a policy decision and an Ed25519-signed, hash-chained, offline-verifiable r
 tiered by instrumentation: semantic deny/approve of a **named** action at the top (bolt-on/serve),
 tool-call gating through the proxy/hook seams elsewhere.
 
+**Broker over HTTP (sidecar lane).** `kriya-gateway broker --config broker.yaml --listen
+127.0.0.1:15090` serves the same governed broker as streamable-HTTP MCP at
+`http://127.0.0.1:15090/mcp` instead of stdio (`--listen 127.0.0.1:0` picks a free port; the bound
+address is printed on stderr). `POST /mcp` takes a JSON-RPC request or batch and always answers
+`application/json` (notifications get `202`); `initialize` issues an `Mcp-Session-Id`, which is
+never required afterwards; bodies are capped at 1 MiB; every response closes the connection. One
+governor, one signed chain and one approval gate serve all callers, one request at a time. An
+inbound `X-Kriya-Chain: a,b` header (validated, else ignored) is recorded as `"chain": ["a","b",
+"<actor>"]` on every receipt for that request and forwarded to HTTP upstreams as
+`X-Kriya-Chain: a,b,<actor>` — a cooperative, caller-asserted record of origin, not proof of it.
+This version offers **no server-initiated stream**: `GET /mcp` is `405`, so server→client
+notifications and requests are not delivered over HTTP. Without `--listen` the broker speaks stdio
+exactly as before.
+
 > **Honest scope.** A named-action policy needs an instrumented app; the proxy/hook seams govern
 > tool calls, not what happens inside an app. The audit trail is tamper-**evident** (hash-chained,
 > offline-verifiable), not tamper-proof.

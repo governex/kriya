@@ -117,6 +117,13 @@ impl ActionExecutor for RouterExecutor {
         // Delegate with the inner (un-namespaced) name — exactly what the sub-executor expects.
         sub.execute(inner, params)
     }
+
+    fn set_call_chain(&mut self, chain: Option<&str>) {
+        // Every front sees the same per-call chain; only the one the call routes to will use it.
+        for sub in self.fronts.values_mut() {
+            sub.set_call_chain(chain);
+        }
+    }
 }
 
 /// One MCP endpoint over many governed fronts. Owns the union tool list (namespaced + policy
@@ -267,6 +274,14 @@ impl RouterServer {
             }
         }
         out
+    }
+
+    /// Set (or clear, with `None`) the cooperative origin chain (C3) for the next request(s): every
+    /// receipt the governor signs carries it as the `chain` param, and an HTTP upstream's
+    /// `tools/call` carries it as `X-Kriya-Chain`. The HTTP serve mode sets it per request and clears
+    /// it afterwards; the stdio serve loop never sets it (receipts stay byte-identical).
+    pub fn set_call_chain(&mut self, chain: Option<Vec<String>>) {
+        self.governor.set_call_chain(chain);
     }
 
     /// Total tools across all fronts (pre-policy) — for the startup banner.
