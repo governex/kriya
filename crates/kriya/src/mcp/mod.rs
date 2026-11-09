@@ -50,6 +50,11 @@ pub mod contain;
 #[cfg(feature = "mcp-client")]
 pub mod router;
 
+// Streamable-HTTP serve mode for the router (`kriya-gateway broker --listen`, the sidecar lane):
+// `POST /mcp` JSON-RPC over a hand-rolled std `TcpListener`, same idiom as `contain`. Std-only.
+#[cfg(feature = "mcp-client")]
+pub mod http_serve;
+
 #[cfg(target_os = "macos")]
 pub use approval::GuiApproval;
 pub use approval::{

@@ -212,6 +212,18 @@ impl McpClient {
         }
     }
 
+    /// Set (or clear) the cooperative origin chain sent as `X-Kriya-Chain` on subsequent HTTP
+    /// requests. A stdio upstream has no header to carry it on, so this is a no-op there.
+    pub fn set_call_chain(&mut self, chain: Option<String>) {
+        match &mut self.backend {
+            Backend::Stdio(_) => {
+                let _ = chain;
+            }
+            #[cfg(feature = "mcp-http")]
+            Backend::Http(h) => h.call_chain = chain,
+        }
+    }
+
     /// Take the governed-lane io observation captured on the most recent request, if the backend
     /// records one. The HTTP transport captures `{dest_host, observed payload bytes, content hash}`
     /// (doc 24 §4.1); the stdio backend records **nothing** — a stdio child's own outbound sockets
@@ -361,6 +373,9 @@ struct HttpTransport {
     /// AFTER `last_io.content_sha256` is computed over the placeholder form, and only for an alias
     /// scoped to this transport's own `host` — see `secrets::broker_body`.
     secrets: Option<crate::secrets::SecretsPolicy>,
+    /// Cooperative origin chain (C3) for the current governed call, sent as `X-Kriya-Chain`.
+    /// `None` (the default, and always outside an HTTP-served broker call) → header not sent.
+    call_chain: Option<String>,
 }
 
 #[cfg(feature = "mcp-http")]
@@ -387,6 +402,7 @@ impl HttpTransport {
             agent,
             last_io: None,
             secrets,
+            call_chain: None,
         }
     }
 
@@ -409,6 +425,9 @@ impl HttpTransport {
         }
         for (k, v) in &self.extra_headers {
             req = req.set(k, v);
+        }
+        if let Some(chain) = &self.call_chain {
+            req = req.set("X-Kriya-Chain", chain);
         }
         req
     }

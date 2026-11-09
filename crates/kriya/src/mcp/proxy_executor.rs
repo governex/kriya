@@ -45,6 +45,12 @@ impl ActionExecutor for McpProxyExecutor {
             Err(e) => ActionOutcome::failed(format!("downstream unavailable: {e}")).with_io(io),
         }
     }
+
+    fn set_call_chain(&mut self, chain: Option<&str>) {
+        if let Ok(mut client) = self.client.lock() {
+            client.set_call_chain(chain.map(str::to_string));
+        }
+    }
 }
 
 /// Map a downstream `CallToolResult` onto an `ActionOutcome`:

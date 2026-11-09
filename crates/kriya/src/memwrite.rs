@@ -358,6 +358,25 @@ pub fn emit_memory_receipt(
     corr: &Correlation,
     salt: &[u8],
 ) -> SignedReceipt {
+    emit_memory_receipt_chained(signer, actor, verb, verb_basis, surface, content, success, corr, salt, None)
+}
+
+/// [`emit_memory_receipt`] plus the cooperative origin chain (C3): with `Some(chain)` the receipt's
+/// params carry a top-level `chain` array (the broker's HTTP serve mode); `None` is byte-identical
+/// to [`emit_memory_receipt`].
+#[allow(clippy::too_many_arguments)]
+pub fn emit_memory_receipt_chained(
+    signer: &Signer,
+    actor: Option<&Actor>,
+    verb: MemoryVerb,
+    verb_basis: VerbBasis,
+    surface: &MemorySurface,
+    content: &[u8],
+    success: bool,
+    corr: &Correlation,
+    salt: &[u8],
+    chain: Option<&[String]>,
+) -> SignedReceipt {
     let content_sha256 = sha256_hex(content);
     let content_bytes = content.len() as u64;
 
@@ -383,6 +402,12 @@ pub fn emit_memory_receipt(
 
     let mut top = serde_json::Map::new();
     top.insert(RESERVED_KEY.to_string(), Value::Object(mem));
+    if let Some(chain) = chain {
+        top.insert(
+            "chain".to_string(),
+            Value::Array(chain.iter().cloned().map(Value::String).collect()),
+        );
+    }
     let params = corr::attach(Value::Object(top), corr);
 
     signer.record(

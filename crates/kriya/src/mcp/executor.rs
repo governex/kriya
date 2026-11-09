@@ -260,6 +260,12 @@ impl IoRecord {
 /// re-check policy — that decision was already made and audited by the [`super::governor`].
 pub trait ActionExecutor: Send {
     fn execute(&mut self, action_id: &str, params: &Value) -> ActionOutcome;
+
+    /// Set (or clear, with `None`) the cooperative origin chain for the calls that follow — the
+    /// comma-joined `X-Kriya-Chain` value an HTTP-transport executor forwards on its upstream
+    /// request. Set by the governor for exactly one dispatch and cleared after it. Default: no-op
+    /// (an in-process or stdio executor has no header to carry it on).
+    fn set_call_chain(&mut self, _chain: Option<&str>) {}
 }
 
 /// Adapts a closure into an [`ActionExecutor`]. Handy for tests and for embedders that

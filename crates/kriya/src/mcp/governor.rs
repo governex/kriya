@@ -277,6 +277,11 @@ pub struct Governor {
     /// in-process server / tests) → byte-identical to pre-S3. No `parent_step_id`/`agent_id`: the
     /// proxy lane sees no sub-agent lineage, and guessing one would be dishonest.
     run_id: Option<String>,
+    /// Cooperative origin chain (C3) for the call being dispatched — set per request by the
+    /// HTTP-served broker (`X-Kriya-Chain` + this hop's actor) and stamped as the `chain` param on
+    /// every receipt this governor signs while it is set. `None` (stdio, in-process, tests) →
+    /// receipts byte-identical to before.
+    chain: Option<Vec<String>>,
 }
 
 impl Governor {
@@ -297,7 +302,30 @@ impl Governor {
             egress: None,
             ingress: None,
             run_id: None,
+            chain: None,
         }
+    }
+
+    /// Set (or clear, with `None`) the cooperative origin chain (C3) for the following dispatch(es):
+    /// stamped as the `chain` param on every receipt this governor signs, and handed to the executor
+    /// (comma-joined) so an HTTP upstream receives it as `X-Kriya-Chain`. The caller clears it after
+    /// the request it belongs to.
+    pub fn set_call_chain(&mut self, chain: Option<Vec<String>>) {
+        let joined = chain.as_ref().map(|c| c.join(","));
+        self.executor.set_call_chain(joined.as_deref());
+        self.chain = chain;
+    }
+
+    /// Add the `chain` param to a receipt's params when a chain is set. A no-op without one (and on
+    /// non-object params, defensively), so the ungoverned-chain path stays byte-identical.
+    fn stamp_chain(&self, mut params: Value) -> Value {
+        if let (Some(chain), Some(obj)) = (&self.chain, params.as_object_mut()) {
+            obj.insert(
+                "chain".to_string(),
+                Value::Array(chain.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        params
     }
 
     /// Attribute every receipt this governor signs to `actor` (R8). Chainable on `new`.
@@ -407,7 +435,7 @@ impl Governor {
             Receipt::new(
                 action_step_id.clone(),
                 action_id.to_string(),
-                corr_params,
+                self.stamp_chain(corr_params),
                 outcome.success,
                 now_ms(),
             )
@@ -450,7 +478,7 @@ impl Governor {
                 } else {
                     crate::memwrite::VerbBasis::ToolWrite
                 };
-                crate::memwrite::emit_memory_receipt(
+                crate::memwrite::emit_memory_receipt_chained(
                     &self.signer,
                     self.actor.as_ref(),
                     entry.op.verb(),
@@ -464,6 +492,7 @@ impl Governor {
                         agent_id: None,
                     },
                     &[],
+                    self.chain.as_deref(),
                 );
             }
         }
@@ -696,7 +725,7 @@ impl Governor {
             let receipt = Receipt::new(
                 uuid::Uuid::new_v4().to_string(),
                 io.action_id(),
-                io.params(Some(action_step_id)),
+                self.stamp_chain(io.params(Some(action_step_id))),
                 true,
                 now_ms(),
             )
@@ -738,7 +767,7 @@ impl Governor {
         let receipt = Receipt::new(
             uuid::Uuid::new_v4().to_string(),
             io.action_id(),
-            io.params(Some(corr)),
+            self.stamp_chain(io.params(Some(corr))),
             true,
             now_ms(),
         )
@@ -772,7 +801,7 @@ impl Governor {
         let receipt = Receipt::new(
             uuid::Uuid::new_v4().to_string(),
             io.action_id(),
-            io.params(Some(corr)),
+            self.stamp_chain(io.params(Some(corr))),
             decision != IoDecision::Deny,
             now_ms(),
         )
@@ -861,7 +890,7 @@ impl Governor {
         let receipt = Receipt::new(
             uuid::Uuid::new_v4().to_string(),
             io.action_id(),
-            io.params(None),
+            self.stamp_chain(io.params(None)),
             false,
             now_ms(),
         )
@@ -1198,6 +1227,37 @@ budget:
                     .unwrap_or(false)
             })
             .collect()
+    }
+
+    #[test]
+    fn call_chain_is_stamped_on_every_receipt_and_cleared_after() {
+        let (s, log) = signer_with_log();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let mut g = egress_governor(
+            s,
+            "rules:\n  - host: \"*.vendor.com\"\n    tier: allow\nunlisted: deny\n",
+            "api.vendor.com",
+            ran.clone(),
+            Box::new(DenyApproval),
+        );
+        g.set_call_chain(Some(vec!["a".into(), "broker".into()]));
+        assert!(matches!(
+            g.dispatch("widgets__list", &json!({"q": 1})),
+            DispatchOutcome::Executed { .. }
+        ));
+        g.set_call_chain(None);
+        assert!(matches!(
+            g.dispatch("widgets__list", &json!({"q": 2})),
+            DispatchOutcome::Executed { .. }
+        ));
+        let all = read_receipts(&log);
+        assert_eq!(all.len(), 4, "action + io per call: {all:?}");
+        for r in &all[..2] {
+            assert_eq!(r["params"]["chain"], json!(["a", "broker"]), "{r}");
+        }
+        for r in &all[2..] {
+            assert!(r["params"].get("chain").is_none(), "cleared: {r}");
+        }
     }
 
     #[test]
