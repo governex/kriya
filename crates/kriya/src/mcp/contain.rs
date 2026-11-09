@@ -53,7 +53,8 @@
 //! never the body. `X-Kriya-Chain` is **cooperative**, not an identity proof: any hop can forge or
 //! drop it; it is lineage metadata for honest workloads, receipted as observed. Plain-HTTP
 //! forward is one exchange per connection (`Connection: close` on both legs; no keep-alive, no
-//! `Upgrade`/WebSocket), with a bounded head (64 KiB) and body (64 MiB).
+//! `Upgrade`/WebSocket), with a bounded head (64 KiB) and body (64 MiB), and a 330 s idle
+//! timeout on both of its sockets so a call held in a downstream approval (≤ 300 s) is not cut off.
 //! NEVER claim host-wide coverage — only "agents kriya launches."
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -122,7 +123,14 @@ impl ConnectProxy {
         scope_token: String,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
-        Self::from_listener(listener, policy, signer, actor, scope_token)
+        Self::from_listener(
+            listener,
+            policy,
+            signer,
+            actor,
+            scope_token,
+            FORWARD_IDLE_TIMEOUT,
+        )
     }
 
     /// [`Self::spawn`], but bound on an operator-chosen address (for example a fixed loopback
@@ -137,7 +145,28 @@ impl ConnectProxy {
         scope_token: String,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
-        Self::from_listener(listener, policy, signer, actor, scope_token)
+        Self::from_listener(
+            listener,
+            policy,
+            signer,
+            actor,
+            scope_token,
+            FORWARD_IDLE_TIMEOUT,
+        )
+    }
+
+    /// [`Self::spawn`] with the plain-HTTP forward lane's idle timeout overridden, so tests can
+    /// exercise the cut-off without waiting out [`FORWARD_IDLE_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn spawn_with_forward_idle_timeout(
+        policy: EgressPolicy,
+        signer: Arc<Signer>,
+        actor: Option<Actor>,
+        scope_token: String,
+        forward_idle: Duration,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        Self::from_listener(listener, policy, signer, actor, scope_token, forward_idle)
     }
 
     fn from_listener(
@@ -146,6 +175,7 @@ impl ConnectProxy {
         signer: Arc<Signer>,
         actor: Option<Actor>,
         scope_token: String,
+        forward_idle: Duration,
     ) -> std::io::Result<Self> {
         let port = listener.local_addr()?.port();
         let stop = Arc::new(AtomicBool::new(false));
@@ -179,7 +209,14 @@ impl ConnectProxy {
                         let actor = actor.clone();
                         let scope_token = scope_token.clone();
                         thread::spawn(move || {
-                            handle_connect(stream, &policy, &signer, &actor, &scope_token);
+                            handle_connect(
+                                stream,
+                                &policy,
+                                &signer,
+                                &actor,
+                                &scope_token,
+                                forward_idle,
+                            );
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -212,9 +249,13 @@ impl Drop for ConnectProxy {
     }
 }
 
-/// Idle timeout on every socket the proxy owns (client and destination, both lanes): a stalled
-/// peer frees its handler thread instead of pinning it forever.
+/// Idle timeout for reading a request head and for the CONNECT lane's sockets, and the TCP
+/// connect timeout on both lanes: a stalled peer frees its handler thread instead of pinning it.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Read/write idle timeout on BOTH sockets of the plain-HTTP forward lane once a request is being
+/// forwarded: a governed upstream call can legitimately sit silent through a downstream human-
+/// approval hold of up to 300 s (the runtime's deny-on-timeout), plus 30 s of slack.
+const FORWARD_IDLE_TIMEOUT: Duration = Duration::from_secs(330);
 /// Upper bound on a request head (request line + headers, CONNECT or forward). Larger → 413.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Upper bound on a forwarded plain-HTTP request body (decoded). Larger → 413.
@@ -301,6 +342,7 @@ fn handle_connect(
     signer: &Signer,
     actor: &Option<Actor>,
     scope_token: &str,
+    forward_idle: Duration,
 ) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
@@ -344,7 +386,16 @@ fn handle_connect(
             version,
             headers,
         };
-        forward_lane(reader, stream, req, policy, signer, actor, scope_token);
+        forward_lane(
+            reader,
+            stream,
+            req,
+            policy,
+            signer,
+            actor,
+            scope_token,
+            forward_idle,
+        );
     } else if has_scheme(target, "https://") {
         // An HTTPS URL must arrive as CONNECT (the proxy never terminates TLS) — a client sending
         // `GET https://…` in the clear is misconfigured; refuse rather than downgrade it to HTTP.
@@ -787,6 +838,7 @@ fn read_body<R: BufRead>(r: &mut R, framing: &BodyFraming) -> Result<Vec<u8>, &'
 /// upstream in origin-form (hop-by-hop headers stripped, body re-framed with `Content-Length`,
 /// `Connection: close`, `X-Kriya-Chain` appended), then relay the response until the destination
 /// closes.
+#[allow(clippy::too_many_arguments)]
 fn forward_lane(
     mut reader: BufReader<TcpStream>,
     client: TcpStream,
@@ -795,7 +847,12 @@ fn forward_lane(
     signer: &Signer,
     actor: &Option<Actor>,
     scope_token: &str,
+    forward_idle: Duration,
 ) {
+    // From here on the client may wait out a long upstream call (and may be slow to send its
+    // body) — switch it from the head-read timeout to the forward lane's idle timeout.
+    let _ = client.set_read_timeout(Some(forward_idle));
+    let _ = client.set_write_timeout(Some(forward_idle));
     let valid_line = !req.method.is_empty()
         && req.method.bytes().all(is_tchar)
         && (req.version == "HTTP/1.1" || req.version == "HTTP/1.0");
@@ -894,7 +951,7 @@ fn forward_lane(
     };
     drop(reader);
 
-    let Some(dest) = connect_upstream(&t.host, t.port) else {
+    let Some(dest) = connect_upstream(&t.host, t.port, forward_idle) else {
         rec(
             IoDecision::Deny,
             rule,
@@ -954,14 +1011,24 @@ fn forward_lane(
         return;
     }
 
-    let (relayed, bytes_in) = relay_response(&dest, &client);
-    let reason = if relayed == 0 {
-        let _ = (&client).write_all(
-            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
-        Some("upstream closed without a response".to_string())
-    } else {
-        None
+    let relay = relay_response(&dest, &client);
+    let bytes_in = relay.payload;
+    let reason = match (relay.total, relay.end) {
+        (0, RelayEnd::IdleTimeout) => {
+            let _ = (&client).write_all(
+                b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            Some("upstream idle timeout before a response".to_string())
+        }
+        (0, _) => {
+            let _ = (&client).write_all(
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            Some("upstream closed without a response".to_string())
+        }
+        (_, RelayEnd::IdleTimeout) => Some("upstream idle timeout mid-response".to_string()),
+        (_, RelayEnd::Error) => Some("response relay aborted".to_string()),
+        (_, RelayEnd::Closed) => None,
     };
     let _ = client.shutdown(std::net::Shutdown::Write);
     let _ = dest.shutdown(std::net::Shutdown::Both);
@@ -974,37 +1041,66 @@ fn forward_lane(
     );
 }
 
-/// Resolve and connect to `host:port`, trying each resolved address with [`IO_TIMEOUT`].
-fn connect_upstream(host: &str, port: u16) -> Option<TcpStream> {
+/// Resolve and connect to `host:port`, trying each resolved address with [`IO_TIMEOUT`] for the
+/// TCP connect itself; the established socket then gets the forward lane's `idle` timeout.
+fn connect_upstream(host: &str, port: u16, idle: Duration) -> Option<TcpStream> {
     use std::net::ToSocketAddrs;
     for addr in (host, port).to_socket_addrs().ok()? {
         if let Ok(s) = TcpStream::connect_timeout(&addr, IO_TIMEOUT) {
-            let _ = s.set_read_timeout(Some(IO_TIMEOUT));
-            let _ = s.set_write_timeout(Some(IO_TIMEOUT));
+            let _ = s.set_read_timeout(Some(idle));
+            let _ = s.set_write_timeout(Some(idle));
             return Some(s);
         }
     }
     None
 }
 
+/// Why the response relay stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayEnd {
+    /// The destination closed its side — the normal end of a `Connection: close` exchange.
+    Closed,
+    /// No byte from the destination (or no progress writing to the client) for a whole idle
+    /// timeout. A slow-but-alive upstream never lands here as long as it is inside the window.
+    IdleTimeout,
+    /// Any other socket error (reset, client gone).
+    Error,
+}
+
+/// What [`relay_response`] observed.
+struct Relay {
+    /// Every byte relayed, head included.
+    total: u64,
+    /// Bytes after the response head's terminating CRLFCRLF — the receipt's `bytes_in` (payload,
+    /// never header bytes, matching the ledger's byte-count definition).
+    payload: u64,
+    end: RelayEnd,
+}
+
 /// Relay the destination's response to the client byte-for-byte until the destination closes
-/// (or idles past [`IO_TIMEOUT`]). Returns `(total_bytes_relayed, payload_bytes)` where payload is
-/// everything after the response head's terminating CRLFCRLF — the receipt's `bytes_in` is
-/// payload, never header bytes, matching the ledger's byte-count definition.
-fn relay_response(dest: &TcpStream, client: &TcpStream) -> (u64, u64) {
+/// or stays silent past the socket's idle timeout. Waiting is not an error: a read that blocks
+/// is just the upstream still working, and only a full idle window with no bytes ends the relay.
+fn relay_response(dest: &TcpStream, client: &TcpStream) -> Relay {
     const TERMINATOR: &[u8; 4] = b"\r\n\r\n";
     let mut buf = [0u8; 16 * 1024];
     let (mut total, mut payload) = (0u64, 0u64);
     let mut matched = 0usize;
     let mut in_body = false;
-    loop {
+    let end = loop {
         let n = match (&*dest).read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break RelayEnd::Closed,
             Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if is_timeout(&e) => break RelayEnd::IdleTimeout,
+            Err(_) => break RelayEnd::Error,
         };
         let chunk = buf.get(..n).unwrap_or(&[]);
-        if (&*client).write_all(chunk).is_err() {
-            break;
+        if let Err(e) = (&*client).write_all(chunk) {
+            break if is_timeout(&e) {
+                RelayEnd::IdleTimeout
+            } else {
+                RelayEnd::Error
+            };
         }
         total += n as u64;
         if in_body {
@@ -1025,8 +1121,20 @@ fn relay_response(dest: &TcpStream, client: &TcpStream) -> (u64, u64) {
                 break;
             }
         }
+    };
+    Relay {
+        total,
+        payload,
+        end,
     }
-    (total, payload)
+}
+
+/// A socket timeout surfaces as `WouldBlock` on Unix and `TimedOut` on Windows.
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// Forward bytes unmodified in both directions between the sandboxed client and the real
@@ -1420,5 +1528,85 @@ mod tests {
             Ok(BodyFraming::Chunked)
         ));
         assert!(body_framing(&h(&[("Transfer-Encoding", "gzip, chunked")])).is_err());
+    }
+
+    /// A destination that accepts one request, waits `delay`, then answers a fixed body.
+    fn spawn_slow_destination(delay: Duration) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((conn, _)) = listener.accept() {
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let _ = read_head(&mut r, MAX_HEAD_BYTES);
+                thread::sleep(delay);
+                let _ = (&conn).write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nslow-but-ok",
+                );
+            }
+        });
+        port
+    }
+
+    fn forward_through(forward_idle: Duration, delay: Duration) -> (String, String) {
+        let dport = spawn_slow_destination(delay);
+        let log =
+            std::env::temp_dir().join(format!("kriya-contain-slow-{}.jsonl", uuid::Uuid::new_v4()));
+        let signer = Arc::new(Signer::with_log_path(log.clone()));
+        let proxy = ConnectProxy::spawn_with_forward_idle_timeout(
+            policy_allow_only("127.0.0.1"),
+            signer,
+            None,
+            "scope-slow".to_string(),
+            forward_idle,
+        )
+        .unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", proxy.port())).unwrap();
+        write!(
+            client,
+            "GET http://127.0.0.1:{dport}/slow HTTP/1.1\r\nHost: x\r\n\r\n"
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = client.read_to_string(&mut out);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let receipt = loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if !text.trim().is_empty() || std::time::Instant::now() > deadline {
+                break text;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        drop(proxy);
+        let _ = std::fs::remove_file(&log);
+        (out, receipt)
+    }
+
+    #[test]
+    fn forward_lane_waits_out_a_slow_but_alive_upstream() {
+        // The upstream is silent for 1 s — longer than nothing, well inside a 3 s idle window.
+        let (resp, receipt) = forward_through(Duration::from_secs(3), Duration::from_secs(1));
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(
+            resp.ends_with("slow-but-ok"),
+            "full response delivered: {resp}"
+        );
+        assert!(receipt.contains("kriya.io.egress.http.allow"), "{receipt}");
+        assert!(!receipt.contains("idle timeout"), "{receipt}");
+    }
+
+    #[test]
+    fn forward_lane_cuts_off_an_upstream_silent_past_the_idle_window() {
+        let (resp, receipt) = forward_through(Duration::from_millis(500), Duration::from_secs(1));
+        assert!(resp.starts_with("HTTP/1.1 504"), "got: {resp}");
+        assert!(
+            receipt.contains("upstream idle timeout before a response"),
+            "{receipt}"
+        );
+    }
+
+    #[test]
+    fn forward_idle_timeout_covers_the_approval_window() {
+        assert!(FORWARD_IDLE_TIMEOUT >= Duration::from_secs(300));
+        assert_eq!(IO_TIMEOUT, Duration::from_secs(10));
     }
 }
